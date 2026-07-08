@@ -186,6 +186,30 @@ def test_frame_extraction_fails_when_ffmpeg_writes_no_file(tmp_path, monkeypatch
         extract_frames(video, [frame], tmp_path / "pack")
 
 
+def test_frame_extraction_failure_includes_timestamp_output_and_stderr(tmp_path, monkeypatch):
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"fake")
+    frame = SuggestedFrame(asset_id="asset", timestamp="00:00:03", reason="test", confidence=0.9)
+
+    def fake_run(command, capture_output, text, check):
+        class Completed:
+            returncode = 1
+            stderr = "invalid seek"
+
+        return Completed()
+
+    monkeypatch.setattr("tastepack.frames.subprocess.run", fake_run)
+
+    with pytest.raises(Exception) as exc_info:
+        extract_frames(video, [frame], tmp_path / "pack")
+
+    message = str(exc_info.value)
+    assert "ffmpeg failed" in message
+    assert "3.000" in message
+    assert "frames/asset_000003000.jpg" in message
+    assert "invalid seek" in message
+
+
 def test_frame_extraction_fails_when_ffmpeg_writes_empty_file(tmp_path, monkeypatch):
     video = tmp_path / "input.mp4"
     video.write_bytes(b"fake")

@@ -11,11 +11,15 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from tastepack.config import TastepackConfig
+from tastepack.logging import get_logger, redact_secrets
 from tastepack.schema import TasteAnalysis
 
 
 class GeminiAnalysisError(RuntimeError):
     """Raised when Gemini analysis cannot produce valid structured output."""
+
+
+logger = get_logger("gemini")
 
 
 MOCK_ANALYSIS: dict[str, Any] = {
@@ -119,6 +123,7 @@ def call_with_retries(
     operation: Callable[[], Any],
     config: TastepackConfig,
     sleep: Callable[[float], None] = time.sleep,
+    operation_name: str = "Gemini operation",
 ) -> Any:
     attempt = 1
     while True:
@@ -127,7 +132,15 @@ def call_with_retries(
         except Exception as exc:
             if attempt >= config.gemini_max_retries or not _is_retryable_error(exc):
                 raise
-            sleep(config.gemini_retry_base_delay_seconds * (2 ** (attempt - 1)))
+            delay = config.gemini_retry_base_delay_seconds * (2 ** (attempt - 1))
+            logger.warning(
+                "%s attempt %s failed with retryable error; retrying in %.1fs: %s",
+                operation_name,
+                attempt,
+                delay,
+                redact_secrets(exc),
+            )
+            sleep(delay)
             attempt += 1
 
 
@@ -192,12 +205,15 @@ def analyze_video(
         uploaded = call_with_retries(
             lambda: client.files.upload(file=str(video_path)),
             config,
+            operation_name="Gemini file upload",
         )
+        logger.debug("Uploaded video to Gemini Files API as %s", uploaded.name)
         active_file = wait_for_file_active(
             client.files,
             uploaded,
             timeout_seconds=config.request_timeout_seconds,
         )
+        logger.debug("Gemini file %s is ACTIVE", active_file.name)
         prompt = (
             "Analyze this narrated screen recording. Return strict JSON only matching the "
             "tastepack schema: source_summary, transcript, assets, preference_moments, "
@@ -211,13 +227,14 @@ def analyze_video(
                 config=build_generation_config(),
             ),
             config,
+            operation_name="Gemini generate_content",
         )
     except GeminiAnalysisError:
         primary_error = None
         raise
     except Exception as exc:
         primary_error = exc
-        raise GeminiAnalysisError(f"Gemini API request failed: {exc}") from exc
+        raise GeminiAnalysisError(f"Gemini API request failed: {redact_secrets(exc)}") from exc
     finally:
         if uploaded is not None and config.cleanup_uploaded_files:
             try:

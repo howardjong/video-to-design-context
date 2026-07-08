@@ -4,11 +4,15 @@ import subprocess
 from pathlib import Path
 
 from tastepack.config import TastepackConfig
+from tastepack.logging import get_logger
 from tastepack.schema import AssetExample, SuggestedFrame, TasteAnalysis
 
 
 class FrameExtractionError(RuntimeError):
     """Raised when ffmpeg cannot extract a frame."""
+
+
+logger = get_logger("frames")
 
 
 def select_frames(
@@ -129,12 +133,23 @@ def extract_frames(
             )
         else:
             command = build_ffmpeg_extract_command(video_path, frame.timestamp_seconds, destination)
+            logger.debug("Running ffmpeg frame extraction command: %s", command)
             completed = subprocess.run(command, capture_output=True, text=True, check=False)
             if completed.returncode != 0:
-                raise FrameExtractionError(completed.stderr.strip() or "ffmpeg extraction failed")
+                stderr = completed.stderr.strip() or "no stderr"
+                raise FrameExtractionError(
+                    "ffmpeg failed while extracting frame "
+                    f"at {frame.timestamp_seconds:.3f}s to {relative_path}: {stderr}"
+                )
             if not destination.exists():
-                raise FrameExtractionError(f"Extracted frame is missing: {destination}")
+                raise FrameExtractionError(
+                    f"Extracted frame is missing after ffmpeg success at "
+                    f"{frame.timestamp_seconds:.3f}s: {relative_path}"
+                )
             if destination.stat().st_size == 0:
-                raise FrameExtractionError(f"Extracted frame is empty: {destination}")
+                raise FrameExtractionError(
+                    f"Extracted frame is empty after ffmpeg success at "
+                    f"{frame.timestamp_seconds:.3f}s: {relative_path}"
+                )
         frame_map[round(frame.timestamp_seconds, 3)] = str(relative_path)
     return frame_map

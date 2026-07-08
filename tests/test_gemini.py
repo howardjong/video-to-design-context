@@ -180,6 +180,29 @@ def test_transient_gemini_errors_retry_then_succeed():
     assert len(attempts) == 3
 
 
+def test_retry_logging_includes_attempt_and_error_without_secrets(caplog):
+    attempts = []
+
+    def operation():
+        attempts.append("try")
+        if len(attempts) < 2:
+            raise FakeApiError(429)
+        return "ok"
+
+    result = call_with_retries(
+        operation,
+        TastepackConfig(gemini_max_retries=2),
+        sleep=lambda _: None,
+        operation_name="Gemini generate_content",
+    )
+
+    assert result == "ok"
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "Gemini generate_content attempt 1 failed with retryable error" in messages
+    assert "429" in messages
+    assert "GEMINI_API_KEY" not in messages
+
+
 def test_non_retryable_gemini_errors_fail_without_retry():
     attempts = []
 

@@ -112,6 +112,18 @@ leave uploaded files in Gemini's temporary file store, use:
 uv run tastepack process input.mp4 --out ./claude-pack --no-cleanup-uploaded-files
 ```
 
+For troubleshooting, write detailed step-by-step logs to a file:
+
+```bash
+uv run tastepack process input.mp4 \
+  --out ./claude-pack \
+  --verbosity debug \
+  --log-file ./tastepack.log
+```
+
+Failures include the pipeline step, the reason, and a concrete next action. Logs
+redact API key values before writing to the terminal or log file.
+
 ## Output
 
 The output directory contains:
@@ -202,6 +214,10 @@ uv run ruff check .
 ## Troubleshooting
 
 If the CLI says `ffmpeg` or `ffprobe` is missing, install `ffmpeg` and retry.
+
+If a command fails, read the `Step`, `Why`, and `Next` fields in the error
+message. Rerun with `--verbosity debug --log-file ./tastepack.log` when you need
+the exact pipeline step history.
 
 If preflight rejects the video as corrupt or undecodable, open it locally or
 re-export it as a standard MP4/MOV before retrying.
