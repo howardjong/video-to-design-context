@@ -2,7 +2,13 @@ import json
 
 import pytest
 
-from tastepack.gemini import GeminiAnalysisError, load_api_key, parse_gemini_json
+from tastepack.gemini import (
+    GeminiAnalysisError,
+    build_generation_config,
+    load_api_key,
+    parse_gemini_json,
+    wait_for_file_active,
+)
 from tastepack.schema import TasteAnalysis
 
 
@@ -77,6 +83,13 @@ def test_valid_json_with_invalid_schema_fails_gracefully():
         parse_gemini_json(json.dumps({"transcript": "missing required fields"}))
 
 
+def test_generation_config_requests_json_matching_schema():
+    config = build_generation_config()
+
+    assert config.response_mime_type == "application/json"
+    assert config.response_schema is TasteAnalysis
+
+
 def test_load_api_key_reads_dotenv_without_printing_secret(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
@@ -89,3 +102,51 @@ def test_load_api_key_reads_dotenv_without_printing_secret(tmp_path, monkeypatch
     assert key == "secret-from-dotenv"
     assert "secret-from-dotenv" not in captured.out
     assert "secret-from-dotenv" not in captured.err
+
+
+class FakeFile:
+    def __init__(self, name, state):
+        self.name = name
+        self.state = state
+
+
+class FakeState:
+    def __init__(self, name):
+        self.name = name
+
+
+def test_wait_for_file_active_polls_until_active():
+    seen_names = []
+    files = iter(
+        [
+            FakeFile("files/abc", FakeState("PROCESSING")),
+            FakeFile("files/abc", FakeState("ACTIVE")),
+        ]
+    )
+
+    class FakeFiles:
+        def get(self, name):
+            seen_names.append(name)
+            return next(files)
+
+    active_file = wait_for_file_active(
+        FakeFiles(),
+        FakeFile("files/abc", FakeState("PROCESSING")),
+        sleep=lambda _: None,
+    )
+
+    assert active_file.state.name == "ACTIVE"
+    assert seen_names == ["files/abc", "files/abc"]
+
+
+def test_wait_for_file_active_fails_cleanly_when_processing_fails():
+    class FakeFiles:
+        def get(self, name):
+            return FakeFile(name, "FAILED")
+
+    with pytest.raises(GeminiAnalysisError, match="failed"):
+        wait_for_file_active(
+            FakeFiles(),
+            FakeFile("files/abc", "PROCESSING"),
+            sleep=lambda _: None,
+        )

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +100,42 @@ def load_api_key(env_path: Path | None = None) -> str | None:
     return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 
+def _state_name(file_obj: Any) -> str:
+    state = getattr(file_obj, "state", None)
+    if hasattr(state, "name"):
+        return str(state.name)
+    return str(state or "")
+
+
+def wait_for_file_active(
+    files_client: Any,
+    uploaded_file: Any,
+    timeout_seconds: float = 120.0,
+    poll_interval_seconds: float = 1.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    deadline = time.monotonic() + timeout_seconds
+    current_file = uploaded_file
+    while time.monotonic() < deadline:
+        current_file = files_client.get(name=uploaded_file.name)
+        state = _state_name(current_file).upper()
+        if state == "ACTIVE":
+            return current_file
+        if state in {"FAILED", "ERROR"}:
+            raise GeminiAnalysisError(f"Gemini file processing failed with state {state}")
+        sleep(poll_interval_seconds)
+    raise GeminiAnalysisError("Timed out waiting for Gemini file processing")
+
+
+def build_generation_config() -> Any:
+    from google.genai import types
+
+    return types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=TasteAnalysis,
+    )
+
+
 def analyze_video(
     video_path: Path,
     config: TastepackConfig,
@@ -117,15 +155,26 @@ def analyze_video(
         raise GeminiAnalysisError("google-genai is not installed") from exc
 
     client = genai.Client(api_key=api_key)
-    uploaded = client.files.upload(file=str(video_path))
-    prompt = (
-        "Analyze this narrated screen recording. Return strict JSON only matching the "
-        "tastepack schema: source_summary, transcript, assets, preference_moments, "
-        "suggested_frames, visual_details, motion_details. Avoid vague design language "
-        "unless you explain the concrete visual properties."
-    )
-    response = client.models.generate_content(
-        model=config.gemini_model,
-        contents=[uploaded, prompt],
-    )
+    try:
+        uploaded = client.files.upload(file=str(video_path))
+        active_file = wait_for_file_active(
+            client.files,
+            uploaded,
+            timeout_seconds=config.request_timeout_seconds,
+        )
+        prompt = (
+            "Analyze this narrated screen recording. Return strict JSON only matching the "
+            "tastepack schema: source_summary, transcript, assets, preference_moments, "
+            "suggested_frames, visual_details, motion_details. Avoid vague design language "
+            "unless you explain the concrete visual properties."
+        )
+        response = client.models.generate_content(
+            model=config.gemini_model,
+            contents=[active_file, prompt],
+            config=build_generation_config(),
+        )
+    except GeminiAnalysisError:
+        raise
+    except Exception as exc:
+        raise GeminiAnalysisError(f"Gemini API request failed: {exc}") from exc
     return parse_gemini_json(response.text or "")
