@@ -65,7 +65,7 @@ uv run tastepack process input.mp4 --out ./claude-pack
 Use a specific Gemini model:
 
 ```bash
-uv run tastepack process input.mp4 --out ./claude-pack --model gemini-2.5-pro
+uv run tastepack process input.mp4 --out ./claude-pack --model gemini-3.5-flash
 ```
 
 Tune frame selection:
@@ -134,7 +134,7 @@ Pass a JSON config file with `--config`:
 
 ```json
 {
-  "gemini_model": "gemini-2.5-pro",
+  "gemini_model": "gemini-3.5-flash",
   "frame_confidence_threshold": 0.65,
   "max_frames_per_asset": 6,
   "max_total_frames": 24,

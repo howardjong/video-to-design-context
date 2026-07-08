@@ -3,6 +3,10 @@ import json
 from tastepack.config import TastepackConfig
 
 
+def test_default_model_is_gemini_3_5_flash():
+    assert TastepackConfig().gemini_model == "gemini-3.5-flash"
+
+
 def test_config_values_can_be_loaded_from_file_and_cli_overrides(tmp_path):
     config_path = tmp_path / "tastepack.json"
     config_path.write_text(

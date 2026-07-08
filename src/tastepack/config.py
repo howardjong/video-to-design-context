@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 
 class TastepackConfig(BaseModel):
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_model: str = "gemini-3.5-flash"
     frame_confidence_threshold: float = Field(default=0.5, ge=0, le=1)
     max_frames_per_asset: int = Field(default=6, ge=1)
     max_total_frames: int = Field(default=24, ge=1)
