@@ -14,3 +14,16 @@ def test_video_validation_rejects_unsupported_extensions(tmp_path):
 
     with pytest.raises(VideoValidationError, match="Unsupported"):
         validate_input_video(video, require_tools=False)
+
+
+def test_video_validation_checks_ffmpeg_and_ffprobe_are_available(tmp_path, monkeypatch):
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"not real video")
+
+    def missing_ffprobe(tool):
+        return "/usr/bin/ffmpeg" if tool == "ffmpeg" else None
+
+    monkeypatch.setattr("tastepack.video.shutil.which", missing_ffprobe)
+
+    with pytest.raises(VideoValidationError, match="ffprobe"):
+        validate_input_video(video, require_tools=True)

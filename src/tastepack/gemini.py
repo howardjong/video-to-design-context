@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from tastepack.config import TastepackConfig
@@ -66,6 +67,7 @@ MOCK_ANALYSIS: dict[str, Any] = {
 
 
 def parse_gemini_json(raw: str) -> TasteAnalysis:
+    raw = _strip_json_fence(raw)
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -74,6 +76,26 @@ def parse_gemini_json(raw: str) -> TasteAnalysis:
         return TasteAnalysis.model_validate(payload)
     except ValidationError as exc:
         raise GeminiAnalysisError(f"Gemini JSON failed validation: {exc}") from exc
+
+
+def _strip_json_fence(raw: str) -> str:
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def load_api_key(env_path: Path | None = None) -> str | None:
+    if env_path:
+        load_dotenv(env_path, override=False)
+    else:
+        load_dotenv(override=False)
+    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 
 def analyze_video(
@@ -86,7 +108,7 @@ def analyze_video(
         if mock_payload_path:
             return parse_gemini_json(mock_payload_path.read_text(encoding="utf-8"))
         return TasteAnalysis.model_validate(MOCK_ANALYSIS)
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    api_key = load_api_key()
     if not api_key:
         raise GeminiAnalysisError("GEMINI_API_KEY is required unless --mock-gemini is used")
     try:

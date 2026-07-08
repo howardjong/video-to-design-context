@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 from tastepack.config import TastepackConfig
-from tastepack.schema import SuggestedFrame
+from tastepack.schema import AssetExample, SuggestedFrame, TasteAnalysis
 
 
 class FrameExtractionError(RuntimeError):
@@ -35,6 +35,46 @@ def select_frames(
         if len(by_key) >= config.max_total_frames:
             break
     return sorted(by_key.values(), key=lambda item: (item.asset_id, item.timestamp_seconds))
+
+
+def select_frames_for_analysis(
+    analysis: TasteAnalysis,
+    config: TastepackConfig,
+    video_duration_seconds: float | None = None,
+) -> list[SuggestedFrame]:
+    selected = select_frames(analysis.suggested_frames, config, video_duration_seconds)
+    asset_ranges = {asset.id: asset for asset in analysis.assets}
+    for frame in selected:
+        asset = asset_ranges.get(frame.asset_id)
+        if asset:
+            frame.timestamp_seconds = min(
+                max(frame.timestamp_seconds, asset.start_seconds),
+                asset.end_seconds,
+            )
+    return selected
+
+
+def build_fallback_frames(
+    assets: list[AssetExample],
+    config: TastepackConfig,
+) -> list[SuggestedFrame]:
+    frames: list[SuggestedFrame] = []
+    for asset in assets:
+        seconds = asset.start_seconds
+        asset_count = 0
+        while seconds <= asset.end_seconds and asset_count < config.max_frames_per_asset:
+            frame = SuggestedFrame(
+                asset_id=asset.id,
+                timestamp=seconds,
+                reason="Fallback interval frame",
+                confidence=config.frame_confidence_threshold,
+            )
+            frames.append(frame)
+            if len(frames) >= config.max_total_frames:
+                return frames
+            seconds += config.fallback_interval_seconds
+            asset_count += 1
+    return frames
 
 
 def frame_filename(frame: SuggestedFrame) -> str:

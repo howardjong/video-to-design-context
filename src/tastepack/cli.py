@@ -6,7 +6,7 @@ import typer
 
 from tastepack.artifacts import generate_artifacts
 from tastepack.config import TastepackConfig
-from tastepack.frames import extract_frames, select_frames
+from tastepack.frames import build_fallback_frames, extract_frames, select_frames_for_analysis
 from tastepack.gemini import GeminiAnalysisError, analyze_video
 from tastepack.video import VideoValidationError, probe_duration_seconds, validate_input_video
 
@@ -67,11 +67,13 @@ def process(
             mock=mock_gemini,
             mock_payload_path=mock_payload,
         )
-        selected_frames = select_frames(
-            analysis.suggested_frames,
+        selected_frames = select_frames_for_analysis(
+            analysis,
             config,
             video_duration_seconds=duration,
         )
+        if not selected_frames:
+            selected_frames = build_fallback_frames(analysis.assets, config)
         frame_map = extract_frames(input_video, selected_frames, out, skip_ffmpeg=skip_ffmpeg)
         generate_artifacts(out, analysis, frame_map, config, input_video.name)
     except (VideoValidationError, GeminiAnalysisError, ValueError, RuntimeError) as exc:

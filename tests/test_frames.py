@@ -2,10 +2,66 @@ from pathlib import Path
 
 from tastepack.config import TastepackConfig
 from tastepack.frames import (
+    build_fallback_frames,
     build_ffmpeg_extract_command,
     select_frames,
+    select_frames_for_analysis,
 )
-from tastepack.schema import SuggestedFrame
+from tastepack.schema import SuggestedFrame, TasteAnalysis
+
+
+def analysis_with_frames(frame_timestamps):
+    return TasteAnalysis.model_validate(
+        {
+            "source_summary": "Review",
+            "transcript": "Narration",
+            "assets": [
+                {
+                    "id": "a",
+                    "name": "Asset A",
+                    "kind": "website",
+                    "start_timestamp": "00:00:05",
+                    "end_timestamp": "00:00:10",
+                    "summary": "First asset",
+                }
+            ],
+            "preference_moments": [
+                {
+                    "asset_id": "a",
+                    "timestamp": "00:00:06",
+                    "sentiment": "positive",
+                    "preference": "Likes close alignment between headline and action.",
+                    "rationale": "The relationship makes the primary action easy to scan.",
+                    "categories": ["layout"],
+                    "confidence": 0.8,
+                }
+            ],
+            "suggested_frames": [
+                {
+                    "asset_id": "a",
+                    "timestamp": timestamp,
+                    "reason": "Suggested by model",
+                    "confidence": 0.9,
+                }
+                for timestamp in frame_timestamps
+            ],
+            "visual_details": {
+                "style": [],
+                "layout": [],
+                "information_hierarchy": [],
+                "typography": [],
+                "color": [],
+                "dashboard": [],
+                "presentation": [],
+                "negative_preferences": [],
+            },
+            "motion_details": {
+                "animations": [],
+                "interaction_details": [],
+                "motion_preferences": [],
+            },
+        }
+    )
 
 
 def test_duplicate_frame_timestamps_are_deduplicated():
@@ -38,6 +94,23 @@ def test_out_of_range_frame_timestamps_are_clamped_to_video_duration():
     selected = select_frames(frames, TastepackConfig(), video_duration_seconds=10)
 
     assert selected[0].timestamp_seconds == 10
+
+
+def test_frame_timestamps_are_clamped_to_asset_range():
+    analysis = analysis_with_frames(["00:00:12"])
+
+    selected = select_frames_for_analysis(analysis, TastepackConfig())
+
+    assert selected[0].timestamp_seconds == 10
+
+
+def test_fallback_frames_are_created_when_gemini_suggests_none():
+    analysis = analysis_with_frames([])
+
+    fallback = build_fallback_frames(analysis.assets, TastepackConfig(fallback_interval_seconds=2))
+
+    assert [frame.timestamp_seconds for frame in fallback] == [5.0, 7.0, 9.0]
+    assert all(frame.reason == "Fallback interval frame" for frame in fallback)
 
 
 def test_ffmpeg_command_generation_handles_spaces_in_paths(tmp_path: Path):
