@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from tastepack.config import TastepackConfig
 from tastepack.frames import (
     build_fallback_frames,
@@ -105,6 +107,14 @@ def test_frame_timestamps_are_clamped_to_asset_range():
     assert selected[0].timestamp_seconds == 10
 
 
+def test_frames_are_deduplicated_after_asset_range_clamping():
+    analysis = analysis_with_frames(["00:00:11", "00:00:12"])
+
+    selected = select_frames_for_analysis(analysis, TastepackConfig())
+
+    assert [frame.timestamp_seconds for frame in selected] == [10]
+
+
 def test_fallback_frames_are_created_when_gemini_suggests_none():
     analysis = analysis_with_frames([])
 
@@ -156,3 +166,41 @@ def test_frame_extraction_writes_expected_files(tmp_path, monkeypatch):
     frame_path = tmp_path / "pack" / frame_map[3.0]
     assert frame_path.exists()
     assert frame_path.read_bytes() == b"jpeg"
+
+
+def test_frame_extraction_fails_when_ffmpeg_writes_no_file(tmp_path, monkeypatch):
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"fake")
+    frame = SuggestedFrame(asset_id="asset", timestamp="00:00:03", reason="test", confidence=0.9)
+
+    def fake_run(command, capture_output, text, check):
+        class Completed:
+            returncode = 0
+            stderr = ""
+
+        return Completed()
+
+    monkeypatch.setattr("tastepack.frames.subprocess.run", fake_run)
+
+    with pytest.raises(Exception, match="missing"):
+        extract_frames(video, [frame], tmp_path / "pack")
+
+
+def test_frame_extraction_fails_when_ffmpeg_writes_empty_file(tmp_path, monkeypatch):
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"fake")
+    frame = SuggestedFrame(asset_id="asset", timestamp="00:00:03", reason="test", confidence=0.9)
+
+    def fake_run(command, capture_output, text, check):
+        Path(command[-1]).write_bytes(b"")
+
+        class Completed:
+            returncode = 0
+            stderr = ""
+
+        return Completed()
+
+    monkeypatch.setattr("tastepack.frames.subprocess.run", fake_run)
+
+    with pytest.raises(Exception, match="empty"):
+        extract_frames(video, [frame], tmp_path / "pack")

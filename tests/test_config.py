@@ -4,7 +4,15 @@ from tastepack.config import TastepackConfig
 
 
 def test_default_model_is_gemini_3_5_flash():
-    assert TastepackConfig().gemini_model == "gemini-3.5-flash"
+    config = TastepackConfig()
+
+    assert config.gemini_model == "gemini-3.5-flash"
+    assert config.max_duration_seconds == 1800
+    assert config.max_file_size_bytes == 2_147_483_648
+    assert config.allow_no_audio is False
+    assert config.gemini_max_retries == 3
+    assert config.gemini_retry_base_delay_seconds == 1.0
+    assert config.cleanup_uploaded_files is True
 
 
 def test_config_values_can_be_loaded_from_file_and_cli_overrides(tmp_path):

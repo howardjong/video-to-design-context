@@ -121,6 +121,7 @@ def generate_artifacts(
     frame_map: dict[float, str],
     config: TastepackConfig,
     source_video_name: str,
+    source_video_metadata: dict | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     taste_packet = build_taste_packet_markdown(analysis, frame_map, source_video_name)
@@ -132,7 +133,9 @@ def generate_artifacts(
         encoding="utf-8",
     )
     metadata = {
+        "run_status": "complete",
         "source_video": source_video_name,
+        "source_video_metadata": source_video_metadata or {},
         "gemini_model": config.gemini_model,
         "assets_count": len(analysis.assets),
         "preference_moments_count": len(analysis.preference_moments),

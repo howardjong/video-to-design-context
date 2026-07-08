@@ -40,6 +40,11 @@ brew install ffmpeg
 
 The CLI validates both tools before live frame extraction.
 
+Live runs also use strict preflight checks before uploading anything to Gemini:
+the input must be decodable, contain a video stream, have a positive duration,
+stay under the configured file-size and duration limits, and include an audio
+stream unless visual-only mode is explicitly enabled.
+
 ## Gemini API Key
 
 Copy `.env.example` to `.env` and fill in your key:
@@ -84,6 +89,29 @@ Skip PDF generation:
 uv run tastepack process input.mp4 --out ./claude-pack --no-pdf
 ```
 
+Adjust strict preflight and Gemini retry behavior:
+
+```bash
+uv run tastepack process input.mp4 \
+  --out ./claude-pack \
+  --max-duration-seconds 1800 \
+  --max-file-size-mb 2048 \
+  --gemini-max-retries 3
+```
+
+For intentionally visual-only recordings, opt in explicitly:
+
+```bash
+uv run tastepack process input.mp4 --out ./claude-pack --allow-no-audio
+```
+
+By default, uploaded Gemini Files API files are cleaned up after processing. To
+leave uploaded files in Gemini's temporary file store, use:
+
+```bash
+uv run tastepack process input.mp4 --out ./claude-pack --no-cleanup-uploaded-files
+```
+
 ## Output
 
 The output directory contains:
@@ -107,6 +135,11 @@ and frame references.
 layout, information hierarchy, typography, color, motion, interaction details,
 dashboard-specific preferences, presentation-specific preferences, and negative
 preferences.
+
+The run is hard-fail by default. If Gemini analysis, frame extraction, Markdown
+generation, metadata writing, or PDF generation fails, `tastepack` removes its
+temporary staging directory and does not promote a partial pack. Existing output
+directories are left untouched on failure.
 
 ## Mocked and Offline Mode
 
@@ -140,6 +173,12 @@ Pass a JSON config file with `--config`:
   "max_total_frames": 24,
   "produce_pdf": true,
   "fallback_interval_seconds": 2,
+  "max_duration_seconds": 1800,
+  "max_file_size_bytes": 2147483648,
+  "allow_no_audio": false,
+  "gemini_max_retries": 3,
+  "gemini_retry_base_delay_seconds": 1.0,
+  "cleanup_uploaded_files": true,
   "verbosity": "normal"
 }
 ```
@@ -163,6 +202,12 @@ uv run ruff check .
 ## Troubleshooting
 
 If the CLI says `ffmpeg` or `ffprobe` is missing, install `ffmpeg` and retry.
+
+If preflight rejects the video as corrupt or undecodable, open it locally or
+re-export it as a standard MP4/MOV before retrying.
+
+If preflight rejects a video with no audio, re-record with narration or rerun
+with `--allow-no-audio` when visual-only analysis is intentional.
 
 If Gemini returns malformed JSON, rerun with a shorter video or use
 `--mock-gemini --mock-payload` to validate a fixture locally.

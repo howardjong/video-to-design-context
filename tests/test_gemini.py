@@ -2,9 +2,12 @@ import json
 
 import pytest
 
+from tastepack.config import TastepackConfig
 from tastepack.gemini import (
     GeminiAnalysisError,
+    analyze_video,
     build_generation_config,
+    call_with_retries,
     load_api_key,
     parse_gemini_json,
     wait_for_file_active,
@@ -150,3 +153,112 @@ def test_wait_for_file_active_fails_cleanly_when_processing_fails():
             FakeFile("files/abc", "PROCESSING"),
             sleep=lambda _: None,
         )
+
+
+class FakeApiError(Exception):
+    def __init__(self, code):
+        super().__init__(f"api error {code}")
+        self.code = code
+
+
+def test_transient_gemini_errors_retry_then_succeed():
+    attempts = []
+
+    def operation():
+        attempts.append("try")
+        if len(attempts) < 3:
+            raise FakeApiError(429)
+        return "ok"
+
+    result = call_with_retries(
+        operation,
+        TastepackConfig(gemini_max_retries=3),
+        sleep=lambda _: None,
+    )
+
+    assert result == "ok"
+    assert len(attempts) == 3
+
+
+def test_non_retryable_gemini_errors_fail_without_retry():
+    attempts = []
+
+    def operation():
+        attempts.append("try")
+        raise FakeApiError(401)
+
+    with pytest.raises(FakeApiError):
+        call_with_retries(operation, TastepackConfig(), sleep=lambda _: None)
+
+    assert len(attempts) == 1
+
+
+class FakeGeminiResponse:
+    text = json.dumps(valid_payload())
+
+
+class FakeGeminiFiles:
+    def __init__(self, generate_error=None, delete_error=None):
+        self.generate_error = generate_error
+        self.delete_error = delete_error
+        self.deleted_names = []
+
+    def upload(self, file):
+        return FakeFile("files/uploaded", FakeState("ACTIVE"))
+
+    def get(self, name):
+        return FakeFile(name, FakeState("ACTIVE"))
+
+    def delete(self, name):
+        self.deleted_names.append(name)
+        if self.delete_error:
+            raise self.delete_error
+
+
+class FakeGeminiModels:
+    def __init__(self, error=None):
+        self.error = error
+
+    def generate_content(self, **kwargs):
+        if self.error:
+            raise self.error
+        return FakeGeminiResponse()
+
+
+class FakeGeminiClient:
+    def __init__(self, generate_error=None, delete_error=None):
+        self.files = FakeGeminiFiles(delete_error=delete_error)
+        self.models = FakeGeminiModels(generate_error)
+
+
+def test_analyze_video_deletes_uploaded_file_after_success(tmp_path, monkeypatch):
+    fake_client = FakeGeminiClient()
+    monkeypatch.setattr("tastepack.gemini.load_api_key", lambda: "fake-key")
+    monkeypatch.setattr("google.genai.Client", lambda api_key: fake_client)
+
+    analysis = analyze_video(tmp_path / "input.mp4", TastepackConfig())
+
+    assert analysis.assets[0].name == "Metrics dashboard"
+    assert fake_client.files.deleted_names == ["files/uploaded"]
+
+
+def test_analyze_video_deletes_uploaded_file_after_generation_failure(tmp_path, monkeypatch):
+    fake_client = FakeGeminiClient(generate_error=FakeApiError(401))
+    monkeypatch.setattr("tastepack.gemini.load_api_key", lambda: "fake-key")
+    monkeypatch.setattr("google.genai.Client", lambda api_key: fake_client)
+
+    with pytest.raises(GeminiAnalysisError, match="Gemini API request failed"):
+        analyze_video(tmp_path / "input.mp4", TastepackConfig())
+
+    assert fake_client.files.deleted_names == ["files/uploaded"]
+
+
+def test_cleanup_failure_does_not_fail_successful_analysis(tmp_path, monkeypatch):
+    fake_client = FakeGeminiClient(delete_error=RuntimeError("delete failed"))
+    monkeypatch.setattr("tastepack.gemini.load_api_key", lambda: "fake-key")
+    monkeypatch.setattr("google.genai.Client", lambda api_key: fake_client)
+
+    with pytest.warns(RuntimeWarning, match="Could not delete uploaded Gemini file"):
+        analysis = analyze_video(tmp_path / "input.mp4", TastepackConfig())
+
+    assert analysis.assets[0].id == "asset-1"

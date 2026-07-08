@@ -44,6 +44,7 @@ def select_frames_for_analysis(
 ) -> list[SuggestedFrame]:
     selected = select_frames(analysis.suggested_frames, config, video_duration_seconds)
     asset_ranges = {asset.id: asset for asset in analysis.assets}
+    by_key: dict[tuple[str, float], SuggestedFrame] = {}
     for frame in selected:
         asset = asset_ranges.get(frame.asset_id)
         if asset:
@@ -51,7 +52,11 @@ def select_frames_for_analysis(
                 max(frame.timestamp_seconds, asset.start_seconds),
                 asset.end_seconds,
             )
-    return selected
+        key = (frame.asset_id, round(frame.timestamp_seconds, 3))
+        current = by_key.get(key)
+        if current is None or frame.confidence > current.confidence:
+            by_key[key] = frame
+    return sorted(by_key.values(), key=lambda item: (item.asset_id, item.timestamp_seconds))
 
 
 def build_fallback_frames(
@@ -127,5 +132,9 @@ def extract_frames(
             completed = subprocess.run(command, capture_output=True, text=True, check=False)
             if completed.returncode != 0:
                 raise FrameExtractionError(completed.stderr.strip() or "ffmpeg extraction failed")
+            if not destination.exists():
+                raise FrameExtractionError(f"Extracted frame is missing: {destination}")
+            if destination.stat().st_size == 0:
+                raise FrameExtractionError(f"Extracted frame is empty: {destination}")
         frame_map[round(frame.timestamp_seconds, 3)] = str(relative_path)
     return frame_map

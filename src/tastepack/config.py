@@ -16,6 +16,12 @@ class TastepackConfig(BaseModel):
     fallback_interval_seconds: float = Field(default=2.0, gt=0)
     verbosity: Literal["quiet", "normal", "debug"] = "normal"
     request_timeout_seconds: float = Field(default=120.0, gt=0)
+    max_duration_seconds: float = Field(default=1800.0, gt=0)
+    max_file_size_bytes: int = Field(default=2_147_483_648, gt=0)
+    allow_no_audio: bool = False
+    gemini_max_retries: int = Field(default=3, ge=1)
+    gemini_retry_base_delay_seconds: float = Field(default=1.0, gt=0)
+    cleanup_uploaded_files: bool = True
 
     @classmethod
     def from_sources(

@@ -100,6 +100,37 @@ def load_api_key(env_path: Path | None = None) -> str | None:
     return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 
 
+def _error_code(exc: BaseException) -> int | None:
+    for attr in ("code", "status_code"):
+        code = getattr(exc, attr, None)
+        if isinstance(code, int):
+            return code
+    return None
+
+
+def _is_retryable_error(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError | ConnectionError):
+        return True
+    code = _error_code(exc)
+    return code in {408, 429} or (code is not None and code >= 500)
+
+
+def call_with_retries(
+    operation: Callable[[], Any],
+    config: TastepackConfig,
+    sleep: Callable[[float], None] = time.sleep,
+) -> Any:
+    attempt = 1
+    while True:
+        try:
+            return operation()
+        except Exception as exc:
+            if attempt >= config.gemini_max_retries or not _is_retryable_error(exc):
+                raise
+            sleep(config.gemini_retry_base_delay_seconds * (2 ** (attempt - 1)))
+            attempt += 1
+
+
 def _state_name(file_obj: Any) -> str:
     state = getattr(file_obj, "state", None)
     if hasattr(state, "name"):
@@ -155,8 +186,13 @@ def analyze_video(
         raise GeminiAnalysisError("google-genai is not installed") from exc
 
     client = genai.Client(api_key=api_key)
+    uploaded = None
+    primary_error: Exception | None = None
     try:
-        uploaded = client.files.upload(file=str(video_path))
+        uploaded = call_with_retries(
+            lambda: client.files.upload(file=str(video_path)),
+            config,
+        )
         active_file = wait_for_file_active(
             client.files,
             uploaded,
@@ -168,13 +204,31 @@ def analyze_video(
             "suggested_frames, visual_details, motion_details. Avoid vague design language "
             "unless you explain the concrete visual properties."
         )
-        response = client.models.generate_content(
-            model=config.gemini_model,
-            contents=[active_file, prompt],
-            config=build_generation_config(),
+        response = call_with_retries(
+            lambda: client.models.generate_content(
+                model=config.gemini_model,
+                contents=[active_file, prompt],
+                config=build_generation_config(),
+            ),
+            config,
         )
     except GeminiAnalysisError:
+        primary_error = None
         raise
     except Exception as exc:
+        primary_error = exc
         raise GeminiAnalysisError(f"Gemini API request failed: {exc}") from exc
+    finally:
+        if uploaded is not None and config.cleanup_uploaded_files:
+            try:
+                client.files.delete(name=uploaded.name)
+            except Exception as cleanup_exc:
+                if primary_error is None:
+                    import warnings
+
+                    warnings.warn(
+                        f"Could not delete uploaded Gemini file: {cleanup_exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
     return parse_gemini_json(response.text or "")
