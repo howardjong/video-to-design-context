@@ -4,6 +4,7 @@ from tastepack.config import TastepackConfig
 from tastepack.frames import (
     build_fallback_frames,
     build_ffmpeg_extract_command,
+    extract_frames,
     select_frames,
     select_frames_for_analysis,
 )
@@ -132,3 +133,26 @@ def test_ffmpeg_command_generation_handles_spaces_in_paths(tmp_path: Path):
         "2",
         str(output),
     ]
+
+
+def test_frame_extraction_writes_expected_files(tmp_path, monkeypatch):
+    video = tmp_path / "input movie.mp4"
+    video.write_bytes(b"fake")
+    frame = SuggestedFrame(asset_id="asset 1", timestamp="00:00:03", reason="test", confidence=0.9)
+
+    def fake_run(command, capture_output, text, check):
+        Path(command[-1]).write_bytes(b"jpeg")
+
+        class Completed:
+            returncode = 0
+            stderr = ""
+
+        return Completed()
+
+    monkeypatch.setattr("tastepack.frames.subprocess.run", fake_run)
+
+    frame_map = extract_frames(video, [frame], tmp_path / "pack")
+
+    frame_path = tmp_path / "pack" / frame_map[3.0]
+    assert frame_path.exists()
+    assert frame_path.read_bytes() == b"jpeg"

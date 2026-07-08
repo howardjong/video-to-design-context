@@ -72,6 +72,11 @@ def test_invalid_gemini_json_fails_gracefully():
         parse_gemini_json("{not json")
 
 
+def test_valid_json_with_invalid_schema_fails_gracefully():
+    with pytest.raises(GeminiAnalysisError, match="failed validation"):
+        parse_gemini_json(json.dumps({"transcript": "missing required fields"}))
+
+
 def test_load_api_key_reads_dotenv_without_printing_secret(tmp_path, monkeypatch, capsys):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)

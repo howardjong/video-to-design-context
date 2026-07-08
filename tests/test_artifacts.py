@@ -101,3 +101,42 @@ def test_api_keys_are_never_written_to_artifacts(tmp_path, monkeypatch):
     for artifact in tmp_path.glob("*"):
         if artifact.is_file():
             assert "super-secret-key" not in artifact.read_text(errors="ignore")
+
+
+def test_multiple_assets_produce_separate_grouped_sections(tmp_path):
+    payload = valid_payload()
+    payload["assets"].append(
+        {
+            "id": "asset-2",
+            "name": "Pricing page",
+            "kind": "website",
+            "start_timestamp": "00:00:30",
+            "end_timestamp": "00:00:45",
+            "summary": "A pricing page with plan comparison.",
+        }
+    )
+    payload["preference_moments"].append(
+        {
+            "asset_id": "asset-2",
+            "timestamp": "00:00:35",
+            "sentiment": "negative",
+            "preference": "Dislikes equal visual weight across all pricing plans.",
+            "rationale": "The layout hides the recommended path instead of guiding selection.",
+            "categories": ["layout", "information_hierarchy"],
+            "confidence": 0.8,
+        }
+    )
+    analysis = TasteAnalysis.model_validate(payload)
+
+    generate_artifacts(
+        output_dir=tmp_path,
+        analysis=analysis,
+        frame_map={},
+        config=TastepackConfig(produce_pdf=False),
+        source_video_name="input.mp4",
+    )
+
+    taste_packet = (tmp_path / "taste_packet.md").read_text()
+    assert "### Metrics dashboard" in taste_packet
+    assert "### Pricing page" in taste_packet
+    assert taste_packet.index("### Metrics dashboard") < taste_packet.index("### Pricing page")
