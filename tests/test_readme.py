@@ -21,6 +21,11 @@ def test_readme_documents_install_usage_config_mocking_and_troubleshooting():
         "source_sha256",
         "ffprobe_timeout_seconds",
         ".env.example",
+        "process-inbox",
+        "queue-status",
+        "retry-failed",
+        "--gemini-concurrency",
+        "--watch",
     ]
     for phrase in required_phrases:
         assert phrase in readme

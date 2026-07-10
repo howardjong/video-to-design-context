@@ -8,13 +8,18 @@ from pathlib import Path
 import pytest
 
 from tastepack.config import TastepackConfig
+from tastepack.gemini import MOCK_ANALYSIS
 from tastepack.inbox_queue import (
     GeminiGate,
     IntakePaths,
     ProviderCircuitBreaker,
     QueueLockedError,
+    RetryAcknowledgementRequired,
     acquire_dispatcher_lock,
+    config_fingerprint,
     process_inbox,
+    queue_status,
+    retry_failed,
     watch_inbox,
 )
 from tastepack.pipeline import FailureCategory, PipelineFailure
@@ -298,3 +303,106 @@ def test_shared_gemini_gate_observes_rate_limit_cooldown() -> None:
         pass
 
     assert delays == [3.0]
+
+
+def test_recovery_resumes_persisted_analysis_without_calling_gemini(tmp_path: Path) -> None:
+    intake = tmp_path / "tastepack-data"
+    paths = IntakePaths.from_root(intake)
+    paths.ensure()
+    config = TastepackConfig(produce_pdf=False)
+    source_hash = "recovery-hash"
+    fingerprint = config_fingerprint(config)
+    run_key = __import__("hashlib").sha256(f"{source_hash}:{fingerprint}".encode()).hexdigest()
+    job_id = "recovery-job"
+    processing_dir = paths.processing / job_id
+    processing_dir.mkdir()
+    source = processing_dir / "recovered.mp4"
+    source.write_bytes(b"recovery-source")
+    snapshot = processing_dir / "analysis-snapshot.json"
+    snapshot.write_text(
+        json.dumps(
+            {
+                "analysis": MOCK_ANALYSIS,
+                "provider_metadata": {"name": "gemini", "model": config.gemini_model},
+                "source_sha256": source_hash,
+                "config_fingerprint": fingerprint,
+                "run_key": run_key,
+            }
+        )
+    )
+    manifest = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "status": "analysis_validated",
+        "attempt": 1,
+        "source_name": source.name,
+        "claimed_path": f"{job_id}/{source.name}",
+        "analysis_snapshot_path": f"{job_id}/{snapshot.name}",
+        "source_sha256": source_hash,
+        "config_fingerprint": fingerprint,
+        "run_key": run_key,
+        "output_path": f"recovered--{run_key[:12]}",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "history": [],
+    }
+    (paths.jobs / f"{job_id}.json").write_text(json.dumps(manifest))
+    resumed = []
+
+    def preflight(_path: Path, **_kwargs):
+        return {"source_sha256": source_hash, "duration_seconds": 5.0}
+
+    def runner(path: Path, out: Path, _config: TastepackConfig, **kwargs):
+        resumed.append(path.name)
+        assert kwargs["precomputed_analysis"] is not None
+        write_complete_pack(out, source_hash)
+
+    summary = process_inbox(
+        intake,
+        config,
+        stable_seconds=0,
+        preflight=preflight,
+        runner=runner,
+    )
+
+    assert summary.completed == 1
+    assert resumed == ["recovered.mp4"]
+    assert not (paths.inbox / "recovered.mp4").exists()
+    assert len(list(paths.archive.rglob("recovered.mp4"))) == 1
+
+
+def test_provider_failure_requires_explicit_acknowledgement_before_retry(tmp_path: Path) -> None:
+    intake = tmp_path / "tastepack-data"
+    paths = IntakePaths.from_root(intake)
+    paths.ensure()
+    (paths.inbox / "retry.mp4").write_bytes(b"retry")
+
+    def preflight(_path: Path, **_kwargs):
+        return {"source_sha256": "retry-hash", "duration_seconds": 5.0}
+
+    def runner(_path: Path, _out: Path, _config: TastepackConfig, **_kwargs):
+        raise PipelineFailure(
+            "Gemini analysis",
+            "temporary provider failure",
+            "Resolve Gemini before retrying.",
+            FailureCategory.PROVIDER,
+        )
+
+    summary = process_inbox(
+        intake,
+        TastepackConfig(produce_pdf=False),
+        stable_seconds=0,
+        preflight=preflight,
+        runner=runner,
+    )
+    job_id = summary.jobs[0]["job_id"]
+
+    status = queue_status(intake)
+    assert status.state_counts["failed"] == 1
+    with pytest.raises(RetryAcknowledgementRequired):
+        retry_failed(intake, job_id)
+
+    retried = retry_failed(intake, job_id, acknowledge_provider_retry=True)
+
+    assert retried["status"] == "retry_queued"
+    assert (paths.inbox / "retry.mp4").is_file()

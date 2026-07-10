@@ -127,6 +127,53 @@ uv run tastepack process input.mp4 \
 Failures include the pipeline step, the reason, and a concrete next action. Logs
 redact API key values before writing to the terminal or log file.
 
+## Inbox Queue
+
+For repeatable local processing, place videos in `tastepack-data/inbox/` and drain
+the queue:
+
+```bash
+uv run tastepack process-inbox --data-dir ./tastepack-data
+```
+
+Each source is atomically claimed, preflighted, fingerprinted, and processed into
+`output/<source-name>--<run-key>/`. Successful sources move to `archive/`; rejected
+inputs move to `failed/<job-id>/`; manifests and per-job logs live in `jobs/` and
+`logs/`. The source SHA-256 plus output-affecting configuration produces the run key,
+so exact duplicate content is skipped only after the earlier complete pack validates.
+
+Use bounded local workers while keeping Gemini conservative by default:
+
+```bash
+uv run tastepack process-inbox \
+  --data-dir ./tastepack-data \
+  --workers 2 \
+  --gemini-concurrency 1
+```
+
+`--workers` limits claimed local jobs. `--gemini-concurrency` limits simultaneous
+Gemini analyses across those workers. A shared `429` cooldown is honored by all
+workers. A corrupt or unsupported source fails independently, but Gemini, schema,
+frame, artifact, disk, permission, or promotion failures open the circuit breaker:
+no new source is claimed and unclaimed inputs remain in `inbox/`.
+
+Use `--watch --poll-seconds 2` to keep draining stable files after they have remained
+unchanged for `--stable-seconds` (default `10`). Watch mode does not process hidden,
+symlinked, unsupported, or actively changing files.
+
+Inspect and retry work without editing manifests:
+
+```bash
+uv run tastepack queue-status --data-dir ./tastepack-data
+uv run tastepack retry-failed JOB_ID --data-dir ./tastepack-data
+uv run tastepack retry-failed JOB_ID --data-dir ./tastepack-data --acknowledge-provider-retry
+```
+
+Provider failures and interrupted Gemini calls require explicit acknowledgement before
+retrying because the original request may have reached Gemini. A validated analysis
+snapshot is persisted before local artifact work; restart resumes those local steps
+without another Gemini call. A job interrupted before Gemini is safely requeued.
+
 ## Output
 
 The output directory contains:
@@ -274,3 +321,7 @@ in your shell.
 
 If PDF generation fails because of local font or rendering issues, rerun with
 `--no-pdf`; the Markdown artifacts are still generated.
+
+For inbox jobs, inspect `tastepack-data/logs/<job-id>.log` alongside the batch log
+reported by `process-inbox`. Both logs preserve step, reason, and next action while
+redacting API keys and authorization values.

@@ -8,6 +8,7 @@ import re
 import tempfile
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
@@ -20,16 +21,29 @@ from uuid import uuid4
 from tastepack.artifacts import validate_complete_metadata
 from tastepack.config import TastepackConfig
 from tastepack.gemini import GEMINI_PROMPT_VERSION, GEMINI_SCHEMA_VERSION
-from tastepack.logging import get_logger, redact_secrets
+from tastepack.logging import get_logger, job_log_context, redact_secrets
 from tastepack.pipeline import FailureCategory, PipelineFailure, run_processing_job
+from tastepack.schema import TasteAnalysis
 from tastepack.video import VideoValidationError, validate_input_video
 
 logger = get_logger("inbox")
 SUPPORTED_EXTENSIONS = {".mp4", ".mov"}
-TERMINAL_STATES = {"complete", "deferred", "failed", "skipped", "recovery_required"}
+TERMINAL_STATES = {
+    "complete",
+    "deferred",
+    "failed",
+    "recovery_required",
+    "requeued",
+    "retry_queued",
+    "skipped",
+}
 
 
 class QueueLockedError(RuntimeError):
+    pass
+
+
+class RetryAcknowledgementRequired(RuntimeError):
     pass
 
 
@@ -161,6 +175,13 @@ class QueueSummary:
     halt_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class QueueStatus:
+    pending_inputs: int
+    state_counts: dict[str, int]
+    jobs: list[dict[str, Any]]
+
+
 @contextmanager
 def acquire_dispatcher_lock(paths: IntakePaths):
     paths.root.mkdir(parents=True, exist_ok=True)
@@ -211,7 +232,7 @@ def process_inbox(
     gemini_gate = GeminiGate(gemini_concurrency, circuit_breaker, sleep=sleep)
 
     with acquire_dispatcher_lock(paths):
-        _recover_promoted_jobs(paths, summary)
+        resumable_jobs = deque(_recover_jobs(paths, summary, config))
         if summary.halted:
             return summary
         sources = iter(discover_stable_inputs(paths, stable_seconds=stable_seconds, sleep=sleep))
@@ -229,12 +250,16 @@ def process_inbox(
                     and len(pending) < workers
                     and (max_jobs is None or claimed_count < max_jobs)
                 ):
-                    try:
-                        source = next(sources)
-                    except StopIteration:
-                        exhausted = True
-                        break
-                    manifest = claim_input(paths, source)
+                    snapshot: dict[str, Any] | None = None
+                    if resumable_jobs:
+                        manifest, snapshot = resumable_jobs.popleft()
+                    else:
+                        try:
+                            source = next(sources)
+                        except StopIteration:
+                            exhausted = True
+                            break
+                        manifest = claim_input(paths, source)
                     claimed_count += 1
                     future = executor.submit(
                         _execute_claimed_job,
@@ -249,6 +274,7 @@ def process_inbox(
                         runner=runner,
                         circuit_breaker=circuit_breaker,
                         gemini_gate=gemini_gate,
+                        snapshot=snapshot,
                     )
                     pending[future] = manifest
                 if not pending:
@@ -292,6 +318,71 @@ def watch_inbox(
     return summary
 
 
+def queue_status(root: Path) -> QueueStatus:
+    paths = IntakePaths.from_root(root)
+    paths.ensure()
+    state_counts: dict[str, int] = {}
+    jobs: list[dict[str, Any]] = []
+    for manifest_path in sorted(paths.jobs.glob("*.json")):
+        manifest = _read_manifest(manifest_path)
+        if not manifest:
+            state_counts["corrupt"] = state_counts.get("corrupt", 0) + 1
+            continue
+        status = str(manifest.get("status", "unknown"))
+        state_counts[status] = state_counts.get(status, 0) + 1
+        jobs.append(manifest)
+    pending_inputs = sum(1 for path in paths.inbox.iterdir() if _is_supported_input(path))
+    return QueueStatus(
+        pending_inputs=pending_inputs,
+        state_counts=state_counts,
+        jobs=jobs,
+    )
+
+
+def retry_failed(
+    root: Path,
+    job_id: str,
+    *,
+    acknowledge_provider_retry: bool = False,
+) -> dict[str, Any]:
+    paths = IntakePaths.from_root(root)
+    paths.ensure()
+    manifest_path = paths.jobs / f"{job_id}.json"
+    with acquire_dispatcher_lock(paths):
+        manifest = _read_manifest(manifest_path)
+        if manifest is None:
+            raise ValueError(f"Job manifest does not exist or is invalid: {job_id}")
+        if manifest.get("status") not in {"failed", "recovery_required"}:
+            raise ValueError(f"Job {job_id} is not in a retryable failed state")
+        failure = manifest.get("failure")
+        category = failure.get("category") if isinstance(failure, dict) else None
+        if (
+            manifest.get("status") == "recovery_required"
+            or category == FailureCategory.PROVIDER.value
+        ) and not acknowledge_provider_retry:
+            raise RetryAcknowledgementRequired(
+                "Retrying this job may repeat a Gemini API request. "
+                "Pass --acknowledge-provider-retry after reviewing its manifest."
+            )
+        failed_path = manifest.get("failed_path")
+        source = paths.failed / failed_path if isinstance(failed_path, str) else None
+        if source is None or not source.is_file():
+            claimed_path = manifest.get("claimed_path")
+            source = paths.processing / claimed_path if isinstance(claimed_path, str) else None
+        if source is None or not source.is_file():
+            raise ValueError(f"Source video for failed job {job_id} is unavailable")
+        destination = _unique_destination(paths.inbox / manifest["source_name"])
+        source.replace(destination)
+        _transition(
+            paths,
+            manifest,
+            "retry_queued",
+            attempt=int(manifest.get("attempt", 1)) + 1,
+            retry_queued_path=destination.name,
+        )
+    return manifest
+
+
 def _execute_claimed_job(
     paths: IntakePaths,
     manifest: dict[str, Any],
@@ -305,35 +396,40 @@ def _execute_claimed_job(
     runner: Callable[..., Any],
     circuit_breaker: ProviderCircuitBreaker,
     gemini_gate: GeminiGate,
+    snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    try:
-        _process_claimed_job(
-            paths,
-            manifest,
-            config,
-            force=force,
-            mock_gemini=mock_gemini,
-            mock_payload=mock_payload,
-            skip_ffmpeg=skip_ffmpeg,
-            preflight=preflight,
-            runner=runner,
-            gemini_permit=gemini_gate.permit,
-            retry_observer=gemini_gate.observe_retry,
-        )
-    except PipelineFailure as exc:
-        if _was_caused_by(exc, ProviderCircuitOpen):
+    with job_log_context(manifest["job_id"]):
+        logger.info("Starting inbox job for %s", manifest["source_name"])
+        try:
+            _process_claimed_job(
+                paths,
+                manifest,
+                config,
+                force=force,
+                mock_gemini=mock_gemini,
+                mock_payload=mock_payload,
+                skip_ffmpeg=skip_ffmpeg,
+                preflight=preflight,
+                runner=runner,
+                gemini_permit=gemini_gate.permit,
+                retry_observer=gemini_gate.observe_retry,
+                snapshot=snapshot,
+            )
+        except PipelineFailure as exc:
+            if _was_caused_by(exc, ProviderCircuitOpen):
+                _defer_claimed_job(paths, manifest, redact_secrets(exc))
+            else:
+                _record_failure(paths, manifest, exc.category, exc)
+                if exc.category is not FailureCategory.INPUT:
+                    circuit_breaker.trip(redact_secrets(exc))
+        except ProviderCircuitOpen as exc:
             _defer_claimed_job(paths, manifest, redact_secrets(exc))
-        else:
-            _record_failure(paths, manifest, exc.category, exc)
-            if exc.category is not FailureCategory.INPUT:
-                circuit_breaker.trip(redact_secrets(exc))
-    except ProviderCircuitOpen as exc:
-        _defer_claimed_job(paths, manifest, redact_secrets(exc))
-    except VideoValidationError as exc:
-        _record_failure(paths, manifest, FailureCategory.INPUT, exc)
-    except Exception as exc:
-        _record_failure(paths, manifest, FailureCategory.SYSTEM, exc)
-        circuit_breaker.trip(redact_secrets(exc))
+        except VideoValidationError as exc:
+            _record_failure(paths, manifest, FailureCategory.INPUT, exc)
+        except Exception as exc:
+            _record_failure(paths, manifest, FailureCategory.SYSTEM, exc)
+            circuit_breaker.trip(redact_secrets(exc))
+        logger.info("Finished inbox job with state %s", manifest["status"])
     return manifest
 
 
@@ -430,6 +526,7 @@ def _process_claimed_job(
     runner: Callable[..., Any],
     gemini_permit: Callable[[], Any],
     retry_observer: Callable[[float, BaseException], None],
+    snapshot: dict[str, Any] | None = None,
 ) -> None:
     claimed_path = paths.processing / manifest["claimed_path"]
     video_metadata = preflight(claimed_path, require_tools=not skip_ffmpeg, config=config)
@@ -444,6 +541,14 @@ def _process_claimed_job(
     fingerprint = config_fingerprint(config)
     run_key = hashlib.sha256(f"{source_hash}:{fingerprint}".encode()).hexdigest()
     output_name = f"{_safe_stem(manifest['source_name'])}--{run_key[:12]}"
+    if snapshot is not None and manifest.get("run_key") != run_key:
+        raise PipelineFailure(
+            "Recovery",
+            "The recovered source or processing configuration no longer matches "
+            "its analysis snapshot",
+            "Use retry-failed with acknowledgement to run a new Gemini analysis.",
+            FailureCategory.INPUT,
+        )
     output_dir = paths.output / output_name
     _transition(
         paths,
@@ -464,6 +569,31 @@ def _process_claimed_job(
         return
 
     _transition(paths, manifest, "running")
+
+    def persist_lifecycle(state: str, payload: dict[str, Any]) -> None:
+        if state == "gemini_started":
+            _transition(paths, manifest, "gemini_started")
+            return
+        if state == "analysis_validated":
+            snapshot_path = claimed_path.parent / "analysis-snapshot.json"
+            snapshot = {
+                "analysis": payload["analysis"],
+                "provider_metadata": payload["provider_metadata"],
+                "source_sha256": source_hash,
+                "config_fingerprint": fingerprint,
+                "run_key": run_key,
+            }
+            _atomic_write_json(snapshot_path, snapshot)
+            _transition(
+                paths,
+                manifest,
+                "analysis_validated",
+                analysis_snapshot_path=str(snapshot_path.relative_to(paths.processing)),
+            )
+            return
+        if state == "output_promoted":
+            _transition(paths, manifest, "output_promoted")
+
     runner(
         claimed_path,
         output_dir,
@@ -474,6 +604,13 @@ def _process_claimed_job(
         preflight_metadata=video_metadata,
         gemini_permit=gemini_permit,
         retry_observer=retry_observer,
+        lifecycle_callback=persist_lifecycle,
+        precomputed_analysis=(
+            TasteAnalysis.model_validate(snapshot["analysis"]) if snapshot is not None else None
+        ),
+        precomputed_provider_metadata=(
+            snapshot.get("provider_metadata") if snapshot is not None else None
+        ),
     )
     if not _is_complete_pack(output_dir, source_hash):
         raise PipelineFailure(
@@ -483,12 +620,18 @@ def _process_claimed_job(
             FailureCategory.SYSTEM,
         )
     _annotate_pack(output_dir, manifest)
-    _transition(paths, manifest, "output_promoted")
+    if manifest["status"] != "output_promoted":
+        _transition(paths, manifest, "output_promoted")
     archive_path = _archive_source(paths, manifest, source_hash)
     _transition(paths, manifest, "complete", archive_path=archive_path)
 
 
-def _recover_promoted_jobs(paths: IntakePaths, summary: QueueSummary) -> None:
+def _recover_jobs(
+    paths: IntakePaths,
+    summary: QueueSummary,
+    config: TastepackConfig,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    resumable: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for manifest_path in sorted(paths.jobs.glob("*.json")):
         manifest = _read_manifest(manifest_path)
         if not manifest or manifest.get("status") in TERMINAL_STATES:
@@ -516,21 +659,69 @@ def _recover_promoted_jobs(paths: IntakePaths, summary: QueueSummary) -> None:
                 summary.failed += 1
                 summary.halted = True
                 summary.halt_reason = redact_secrets(exc)
+        elif manifest.get("status") == "analysis_validated":
+            snapshot = _load_analysis_snapshot(paths, manifest, config)
+            if snapshot is not None and isinstance(claimed_path, str) and (
+                paths.processing / claimed_path
+            ).is_file():
+                resumable.append((manifest, snapshot))
+            else:
+                _mark_recovery_required(paths, manifest)
+        elif manifest.get("status") in {"claimed", "preflight_passed"}:
+            _requeue_pre_gemini_job(paths, manifest)
         else:
-            _transition(
-                paths,
-                manifest,
-                "recovery_required",
-                failure={
-                    "category": FailureCategory.SYSTEM.value,
-                    "step": "Recovery",
-                    "reason": "A previous job stopped before a verified complete output was found",
-                    "next": (
-                        "Use retry-failed after reviewing the job manifest; "
-                        "Gemini billing may recur."
-                    ),
-                },
-            )
+            _mark_recovery_required(paths, manifest)
+    return resumable
+
+
+def _load_analysis_snapshot(
+    paths: IntakePaths,
+    manifest: dict[str, Any],
+    config: TastepackConfig,
+) -> dict[str, Any] | None:
+    snapshot_name = manifest.get("analysis_snapshot_path")
+    if not isinstance(snapshot_name, str):
+        return None
+    try:
+        snapshot = json.loads((paths.processing / snapshot_name).read_text(encoding="utf-8"))
+        TasteAnalysis.model_validate(snapshot["analysis"])
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(snapshot, dict):
+        return None
+    if snapshot.get("source_sha256") != manifest.get("source_sha256"):
+        return None
+    if snapshot.get("run_key") != manifest.get("run_key"):
+        return None
+    if snapshot.get("config_fingerprint") != config_fingerprint(config):
+        return None
+    if not isinstance(snapshot.get("provider_metadata"), dict):
+        return None
+    return snapshot
+
+
+def _requeue_pre_gemini_job(paths: IntakePaths, manifest: dict[str, Any]) -> None:
+    claimed_path = paths.processing / manifest["claimed_path"]
+    destination = _unique_destination(paths.inbox / manifest["source_name"])
+    if claimed_path.exists():
+        claimed_path.replace(destination)
+    _transition(paths, manifest, "requeued", requeued_path=destination.name)
+
+
+def _mark_recovery_required(paths: IntakePaths, manifest: dict[str, Any]) -> None:
+    _transition(
+        paths,
+        manifest,
+        "recovery_required",
+        failure={
+            "category": FailureCategory.SYSTEM.value,
+            "step": "Recovery",
+            "reason": "A previous job stopped before a verified complete output was found",
+            "next": (
+                "Use retry-failed after reviewing the job manifest; Gemini billing may recur."
+            ),
+        },
+    )
 
 
 def _record_failure(
@@ -638,10 +829,31 @@ def _transition(paths: IntakePaths, manifest: dict[str, Any], state: str, **upda
     manifest["updated_at"] = _timestamp()
     manifest.setdefault("history", []).append({"state": state, "at": manifest["updated_at"]})
     _write_manifest(paths, manifest)
+    _append_job_log(paths, manifest, state)
 
 
 def _write_manifest(paths: IntakePaths, manifest: dict[str, Any]) -> None:
     _atomic_write_json(paths.jobs / f"{manifest['job_id']}.json", manifest)
+
+
+def _append_job_log(paths: IntakePaths, manifest: dict[str, Any], state: str) -> None:
+    details = [
+        manifest["updated_at"],
+        f"job_id={manifest['job_id']}",
+        f"state={state}",
+        f"source={manifest['source_name']}",
+    ]
+    failure = manifest.get("failure")
+    if isinstance(failure, dict):
+        details.extend(
+            (
+                f"step={failure.get('step', '-')}",
+                f"why={redact_secrets(failure.get('reason', '-'))}",
+                f"next={redact_secrets(failure.get('next', '-'))}",
+            )
+        )
+    with (paths.logs / f"{manifest['job_id']}.log").open("a", encoding="utf-8") as handle:
+        handle.write(" ".join(details) + "\n")
 
 
 def _read_manifest(path: Path) -> dict[str, Any] | None:

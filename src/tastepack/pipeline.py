@@ -67,6 +67,9 @@ class PipelineDependencies:
     promote_output: Callable[[Path, Path], None] | None = None
 
 
+LifecycleCallback = Callable[[str, dict[str, Any]], None]
+
+
 def run_step(
     step: str,
     next_step: str,
@@ -138,11 +141,27 @@ def run_processing_job(
     preflight_metadata: dict[str, object] | None = None,
     gemini_permit: Callable[[], Any] | None = None,
     retry_observer: Callable[[float, BaseException], None] | None = None,
+    precomputed_analysis: TasteAnalysis | None = None,
+    precomputed_provider_metadata: dict[str, object] | None = None,
+    lifecycle_callback: LifecycleCallback | None = None,
     dependencies: PipelineDependencies | None = None,
 ) -> PipelineResult:
     dependencies = dependencies or PipelineDependencies(promote_output=promote_output)
     promote = dependencies.promote_output or promote_output
     staging_dir: Path | None = None
+
+    def emit_lifecycle(state: str, payload: dict[str, Any]) -> None:
+        if lifecycle_callback is None:
+            return
+        try:
+            lifecycle_callback(state, payload)
+        except Exception as exc:
+            raise PipelineFailure(
+                "Job state persistence",
+                redact_secrets(exc),
+                "Restore the jobs directory and retry after confirming its permissions.",
+                FailureCategory.SYSTEM,
+            ) from exc
 
     try:
         run_step(
@@ -167,25 +186,30 @@ def run_processing_job(
             duration = None
 
         gemini_telemetry = GeminiRunTelemetry()
-        def analyze_with_provider_permit() -> TasteAnalysis:
-            context = gemini_permit() if gemini_permit is not None else nullcontext()
-            with context:
-                return dependencies.analyze_video(
-                    input_video,
-                    config,
-                    mock=mock_gemini,
-                    mock_payload_path=mock_payload,
-                    telemetry=gemini_telemetry,
-                    video_duration_seconds=duration,
-                    retry_observer=retry_observer,
-                )
+        if precomputed_analysis is None:
 
-        analysis = run_step(
-            "Gemini analysis",
-            "Fix the Gemini response/schema issue or retry after resolving API availability.",
-            analyze_with_provider_permit,
-            FailureCategory.PROVIDER,
-        )
+            def analyze_with_provider_permit() -> TasteAnalysis:
+                context = gemini_permit() if gemini_permit is not None else nullcontext()
+                with context:
+                    emit_lifecycle("gemini_started", {})
+                    return dependencies.analyze_video(
+                        input_video,
+                        config,
+                        mock=mock_gemini,
+                        mock_payload_path=mock_payload,
+                        telemetry=gemini_telemetry,
+                        video_duration_seconds=duration,
+                        retry_observer=retry_observer,
+                    )
+
+            analysis = run_step(
+                "Gemini analysis",
+                "Fix the Gemini response/schema issue or retry after resolving API availability.",
+                analyze_with_provider_permit,
+                FailureCategory.PROVIDER,
+            )
+        else:
+            analysis = precomputed_analysis
         analysis = run_step(
             "Analysis validation",
             "Record a shorter, clearer video or correct the Gemini analysis response "
@@ -193,6 +217,18 @@ def run_processing_job(
             lambda: validate_analysis_for_video(analysis, video_metadata, config),
             FailureCategory.PROVIDER,
         )
+        provider_metadata = precomputed_provider_metadata or build_gemini_provider_metadata(
+            config,
+            gemini_telemetry,
+        )
+        if precomputed_analysis is None:
+            emit_lifecycle(
+                "analysis_validated",
+                {
+                    "analysis": analysis.model_dump(mode="json"),
+                    "provider_metadata": provider_metadata,
+                },
+            )
         selected_frames = run_step(
             "Frame selection",
             "Check Gemini suggested frames, confidence thresholds, and fallback interval.",
@@ -226,7 +262,6 @@ def run_processing_job(
             ),
             FailureCategory.SYSTEM,
         )
-        provider_metadata = build_gemini_provider_metadata(config, gemini_telemetry)
         run_step(
             "Artifact generation",
             "Inspect output permissions and PDF generation settings; retry with --no-pdf.",
@@ -247,6 +282,7 @@ def run_processing_job(
             lambda: promote(staging_dir, out),
             FailureCategory.SYSTEM,
         )
+        emit_lifecycle("output_promoted", {"output_dir": str(out)})
         staging_dir = None
         return PipelineResult(
             output_dir=out,

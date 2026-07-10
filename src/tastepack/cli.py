@@ -15,9 +15,16 @@ from tastepack.gemini import GeminiAnalysisError, analyze_video
 from tastepack.inbox_queue import (
     IntakePaths,
     QueueLockedError,
+    RetryAcknowledgementRequired,
 )
 from tastepack.inbox_queue import (
     process_inbox as run_inbox,
+)
+from tastepack.inbox_queue import (
+    queue_status as get_queue_status,
+)
+from tastepack.inbox_queue import (
+    retry_failed as retry_queue_job,
 )
 from tastepack.inbox_queue import (
     watch_inbox as run_inbox_watch,
@@ -371,6 +378,41 @@ def process_inbox_command(
         raise typer.Exit(code=3)
     if summary.failed:
         raise typer.Exit(code=1)
+
+
+@app.command("queue-status")
+def queue_status_command(
+    data_dir: Path = typer.Option(Path("tastepack-data"), "--data-dir", help="Inbox data root."),
+) -> None:
+    status = get_queue_status(data_dir)
+    typer.echo(f"Pending inputs: {status.pending_inputs}")
+    for state, count in sorted(status.state_counts.items()):
+        typer.echo(f"{state}: {count}")
+
+
+@app.command("retry-failed")
+def retry_failed_command(
+    job_id: str = typer.Argument(..., help="Failed job identifier from queue-status."),
+    data_dir: Path = typer.Option(Path("tastepack-data"), "--data-dir", help="Inbox data root."),
+    acknowledge_provider_retry: bool = typer.Option(
+        False,
+        "--acknowledge-provider-retry",
+        help="Acknowledge that retrying can repeat a Gemini API request.",
+    ),
+) -> None:
+    try:
+        manifest = retry_queue_job(
+            data_dir,
+            job_id,
+            acknowledge_provider_retry=acknowledge_provider_retry,
+        )
+    except (RetryAcknowledgementRequired, ValueError, QueueLockedError) as exc:
+        raise typer.BadParameter(
+            "Step: Retry failed job\n"
+            f"Why: {redact_secrets(exc)}\n"
+            "Next: Review the job manifest and retry with the required acknowledgement."
+        ) from exc
+    typer.echo(f"Queued {manifest['source_name']} for retry from job {manifest['job_id']}.")
 
 
 def promote_output(staging_dir: Path, out: Path) -> None:

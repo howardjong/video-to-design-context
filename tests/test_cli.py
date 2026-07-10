@@ -83,6 +83,22 @@ def test_cli_processes_inbox_in_mock_mode(tmp_path):
     assert json.loads(outputs[0].read_text())["queue"]["run_key"]
 
 
+def test_cli_queue_status_reports_pending_inputs_and_job_states(tmp_path):
+    data_dir = tmp_path / "tastepack-data"
+    (data_dir / "inbox").mkdir(parents=True)
+    (data_dir / "inbox" / "pending.mp4").write_bytes(b"pending")
+    (data_dir / "jobs").mkdir()
+    (data_dir / "jobs" / "job.json").write_text(
+        json.dumps({"job_id": "job", "status": "failed", "source_name": "failed.mp4"})
+    )
+
+    result = runner.invoke(app, ["queue-status", "--data-dir", str(data_dir)])
+
+    assert result.exit_code == 0, result.output
+    assert "Pending inputs: 1" in result.output
+    assert "failed: 1" in result.output
+
+
 def test_skip_ffmpeg_requires_mock_gemini(tmp_path):
     video = tmp_path / "input.mp4"
     video.write_bytes(b"not a decodable video")
