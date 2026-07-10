@@ -66,6 +66,7 @@ def test_inbox_processes_multiple_jobs_and_archives_sources(tmp_path: Path) -> N
         (paths.output / item["output_path"] / "metadata.json").is_file()
         for item in summary.jobs
     )
+    assert not any(paths.processing.iterdir())
 
 
 def test_input_failure_moves_only_that_source_to_failed_and_continues(tmp_path: Path) -> None:

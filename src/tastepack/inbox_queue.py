@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -380,6 +381,7 @@ def retry_failed(
             attempt=int(manifest.get("attempt", 1)) + 1,
             retry_queued_path=destination.name,
         )
+        _cleanup_processing_state(paths, manifest)
     return manifest
 
 
@@ -566,6 +568,7 @@ def _process_claimed_job(
         manifest["output_path"] = existing_output
         archive_path = _archive_source(paths, manifest, source_hash)
         _transition(paths, manifest, "skipped", archive_path=archive_path)
+        _cleanup_processing_state(paths, manifest)
         return
 
     _transition(paths, manifest, "running")
@@ -624,6 +627,7 @@ def _process_claimed_job(
         _transition(paths, manifest, "output_promoted")
     archive_path = _archive_source(paths, manifest, source_hash)
     _transition(paths, manifest, "complete", archive_path=archive_path)
+    _cleanup_processing_state(paths, manifest)
 
 
 def _recover_jobs(
@@ -651,6 +655,7 @@ def _recover_jobs(
                 _transition(paths, manifest, "output_promoted")
                 archive_path = _archive_source(paths, manifest, source_hash)
                 _transition(paths, manifest, "complete", archive_path=archive_path)
+                _cleanup_processing_state(paths, manifest)
                 summary.jobs.append(manifest)
                 summary.completed += 1
             except Exception as exc:
@@ -706,6 +711,7 @@ def _requeue_pre_gemini_job(paths: IntakePaths, manifest: dict[str, Any]) -> Non
     if claimed_path.exists():
         claimed_path.replace(destination)
     _transition(paths, manifest, "requeued", requeued_path=destination.name)
+    _cleanup_processing_state(paths, manifest)
 
 
 def _mark_recovery_required(paths: IntakePaths, manifest: dict[str, Any]) -> None:
@@ -747,11 +753,13 @@ def _record_failure(
     if claimed_path.exists():
         failed_path.parent.mkdir(parents=True, exist_ok=True)
         claimed_path.replace(failed_path)
+    state_files = _move_processing_state_to_failed(paths, manifest)
     _transition(
         paths,
         manifest,
         "failed",
         failed_path=str(failed_path.relative_to(paths.failed)),
+        failed_state_files=state_files,
         failure={
             "category": category.value,
             "step": step,
@@ -773,6 +781,7 @@ def _defer_claimed_job(paths: IntakePaths, manifest: dict[str, Any], reason: str
         deferred_path=destination.name,
         deferred_reason=reason,
     )
+    _cleanup_processing_state(paths, manifest)
 
 
 def _archive_source(paths: IntakePaths, manifest: dict[str, Any], source_hash: str) -> str:
@@ -786,6 +795,38 @@ def _archive_source(paths: IntakePaths, manifest: dict[str, Any], source_hash: s
 
 def _failed_destination(paths: IntakePaths, manifest: dict[str, Any]) -> Path:
     return paths.failed / manifest["job_id"] / manifest["source_name"]
+
+
+def _move_processing_state_to_failed(
+    paths: IntakePaths,
+    manifest: dict[str, Any],
+) -> list[str]:
+    processing_dir = (paths.processing / manifest["claimed_path"]).parent
+    if not processing_dir.is_dir():
+        return []
+    failed_dir = paths.failed / manifest["job_id"]
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    moved: list[str] = []
+    for item in processing_dir.iterdir():
+        destination = _unique_destination(failed_dir / item.name)
+        item.replace(destination)
+        moved.append(str(destination.relative_to(paths.failed)))
+    _cleanup_processing_state(paths, manifest)
+    return moved
+
+
+def _cleanup_processing_state(paths: IntakePaths, manifest: dict[str, Any]) -> None:
+    processing_dir = (paths.processing / manifest["claimed_path"]).parent
+    if not processing_dir.exists():
+        return
+    try:
+        shutil.rmtree(processing_dir)
+    except OSError as exc:
+        logger.warning(
+            "Could not remove terminal processing state for job %s: %s",
+            manifest["job_id"],
+            redact_secrets(exc),
+        )
 
 
 def _annotate_pack(output_dir: Path, manifest: dict[str, Any]) -> None:
