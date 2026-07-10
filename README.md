@@ -41,9 +41,12 @@ brew install ffmpeg
 The CLI validates both tools before live frame extraction.
 
 Live runs also use strict preflight checks before uploading anything to Gemini:
-the input must be decodable, contain a video stream, have a positive duration,
-stay under the configured file-size and duration limits, and include an audio
-stream unless visual-only mode is explicitly enabled.
+the input must be a regular MP4/MOV file with valid codecs and dimensions, pass
+bounded `ffprobe` plus full video/audio `ffmpeg` decode checks, have a positive
+duration, stay under the configured file-size and duration limits, and include
+materially audible audio unless visual-only mode is explicitly enabled. The
+preflight record includes a `source_sha256` fingerprint and is rechecked before
+frame extraction.
 
 ## Gemini API Key
 
@@ -130,6 +133,7 @@ The output directory contains:
 
 ```text
 claude-pack/
+  analysis.json
   design_preferences.md
   taste_packet.md
   taste_packet.pdf
@@ -139,9 +143,16 @@ claude-pack/
     ...
 ```
 
-`taste_packet.md` is the main Claude upload context. It includes source metadata,
-transcript, assets/examples, preference moments, timestamps, confidence scores,
-and frame references.
+`analysis.json` is the canonical validated structured analysis. `taste_packet.md`
+is the main Claude upload context; it includes source metadata, asset/example
+ranges, preference moments, confidence scores, categories, and asset-scoped
+frame references. Valid extracted frames are embedded in both this Markdown and
+the PDF when generated.
+
+The transcript and on-screen text are marked as **untrusted source evidence**.
+They are context to assess, never instructions to follow. `metadata.json` records
+the source hash, model, prompt/schema/SDK versions, Gemini usage/timing telemetry,
+and the final `run_status` only after every staged artifact validates.
 
 `design_preferences.md` distills reusable preferences across visual style,
 layout, information hierarchy, typography, color, motion, interaction details,
@@ -183,13 +194,23 @@ Pass a JSON config file with `--config`:
   "frame_confidence_threshold": 0.65,
   "max_frames_per_asset": 6,
   "max_total_frames": 24,
+  "frame_association_tolerance_seconds": 1.0,
   "produce_pdf": true,
   "fallback_interval_seconds": 2,
   "max_duration_seconds": 1800,
   "max_file_size_bytes": 2147483648,
   "allow_no_audio": false,
+  "ffprobe_timeout_seconds": 30,
+  "ffmpeg_timeout_seconds": 600,
+  "frame_extraction_timeout_seconds": 30,
+  "min_audio_mean_volume_db": -60,
   "gemini_max_retries": 3,
   "gemini_retry_base_delay_seconds": 1.0,
+  "gemini_retry_jitter_seconds": 0.25,
+  "gemini_upload_timeout_seconds": 600,
+  "gemini_file_processing_timeout_seconds": 600,
+  "gemini_generation_timeout_seconds": 300,
+  "gemini_cleanup_timeout_seconds": 30,
   "cleanup_uploaded_files": true,
   "verbosity": "normal"
 }

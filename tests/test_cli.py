@@ -604,3 +604,9 @@ def test_successful_run_promotes_complete_staged_output(tmp_path):
     assert not list(tmp_path.glob(".claude-pack.tmp-*"))
     metadata = json.loads((output_dir / "metadata.json").read_text())
     assert metadata["run_status"] == "complete"
+    assert metadata["provider"]["name"] == "gemini"
+    assert metadata["provider"]["model"] == "gemini-3.5-flash"
+    assert metadata["provider"]["prompt_version"] == "tastepack-video-analysis-v1"
+    assert metadata["provider"]["schema_version"] == "tastepack-analysis-v1"
+    assert metadata["provider"]["sdk_version"]
+    assert metadata["provider"]["telemetry"]["finish_reason"] == "MOCK"

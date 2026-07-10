@@ -10,7 +10,12 @@ import typer
 from tastepack.artifacts import generate_artifacts
 from tastepack.config import TastepackConfig
 from tastepack.frames import extract_frames, select_frames_for_analysis
-from tastepack.gemini import GeminiAnalysisError, analyze_video
+from tastepack.gemini import (
+    GeminiAnalysisError,
+    GeminiRunTelemetry,
+    analyze_video,
+    build_gemini_provider_metadata,
+)
 from tastepack.logging import configure_logging, get_logger, redact_secrets
 from tastepack.schema import TasteAnalysis
 from tastepack.video import VideoValidationError, validate_input_video
@@ -185,6 +190,7 @@ def process(
         duration = video_metadata.get("duration_seconds")
         if not isinstance(duration, int | float) or isinstance(duration, bool):
             duration = None
+        gemini_telemetry = GeminiRunTelemetry()
         analysis = run_step(
             "Gemini analysis",
             "Fix the Gemini response/schema issue or retry after resolving API availability.",
@@ -193,6 +199,7 @@ def process(
                 config,
                 mock=mock_gemini,
                 mock_payload_path=mock_payload,
+                telemetry=gemini_telemetry,
             ),
         )
         analysis = run_step(
@@ -243,6 +250,7 @@ def process(
                 config,
                 input_video.name,
                 source_video_metadata=video_metadata,
+                provider_metadata=build_gemini_provider_metadata(config, gemini_telemetry),
             ),
         )
         run_step(

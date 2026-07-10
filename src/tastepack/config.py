@@ -12,6 +12,7 @@ class TastepackConfig(BaseModel):
     frame_confidence_threshold: float = Field(default=0.5, ge=0, le=1)
     max_frames_per_asset: int = Field(default=6, ge=1)
     max_total_frames: int = Field(default=24, ge=1)
+    frame_association_tolerance_seconds: float = Field(default=1.0, ge=0)
     produce_pdf: bool = True
     fallback_interval_seconds: float = Field(default=2.0, gt=0)
     verbosity: Literal["quiet", "normal", "debug"] = "normal"

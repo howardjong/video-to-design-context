@@ -7,6 +7,7 @@ import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -55,6 +56,14 @@ class GeminiRunTelemetry:
 
 
 logger = get_logger("gemini")
+GEMINI_PROMPT_VERSION = "tastepack-video-analysis-v1"
+GEMINI_SCHEMA_VERSION = "tastepack-analysis-v1"
+GEMINI_ANALYSIS_PROMPT = (
+    "Analyze this narrated screen recording. Return strict JSON only matching the "
+    "tastepack schema: source_summary, transcript, assets, preference_moments, "
+    "suggested_frames, visual_details, motion_details. Avoid vague design language "
+    "unless you explain the concrete visual properties."
+)
 
 
 MOCK_ANALYSIS: dict[str, Any] = {
@@ -137,6 +146,27 @@ def load_api_key(env_path: Path | None = None) -> str | None:
     else:
         load_dotenv(override=False)
     return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+
+
+def gemini_sdk_version() -> str:
+    try:
+        return version("google-genai")
+    except PackageNotFoundError:  # pragma: no cover - dependency is declared.
+        return "unknown"
+
+
+def build_gemini_provider_metadata(
+    config: TastepackConfig,
+    telemetry: GeminiRunTelemetry,
+) -> dict[str, Any]:
+    return {
+        "name": "gemini",
+        "model": config.gemini_model,
+        "prompt_version": GEMINI_PROMPT_VERSION,
+        "schema_version": GEMINI_SCHEMA_VERSION,
+        "sdk_version": gemini_sdk_version(),
+        "telemetry": telemetry.to_metadata(),
+    }
 
 
 def _error_code(exc: BaseException) -> int | None:
@@ -456,16 +486,10 @@ def analyze_video(
             telemetry=telemetry,
         )
         logger.debug("Gemini file %s is ACTIVE", active_file.name)
-        prompt = (
-            "Analyze this narrated screen recording. Return strict JSON only matching the "
-            "tastepack schema: source_summary, transcript, assets, preference_moments, "
-            "suggested_frames, visual_details, motion_details. Avoid vague design language "
-            "unless you explain the concrete visual properties."
-        )
         response = call_with_telemetry(
             lambda: client.models.generate_content(
                 model=config.gemini_model,
-                contents=[active_file, prompt],
+                contents=[active_file, GEMINI_ANALYSIS_PROMPT],
                 config=build_generation_config(config),
             ),
             config,

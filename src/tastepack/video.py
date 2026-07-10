@@ -5,6 +5,7 @@ import math
 import re
 import shutil
 import subprocess
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,24 @@ def source_fingerprint(video_path: Path) -> dict[str, int]:
         "file_size_bytes": stat.st_size,
         "source_mtime_ns": stat.st_mtime_ns,
     }
+
+
+def source_sha256(video_path: Path) -> str:
+    digest = sha256()
+    with video_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _stable_source_metadata(
+    video_path: Path,
+    expected_fingerprint: dict[str, int],
+) -> dict[str, Any]:
+    source_hash = source_sha256(video_path)
+    if source_fingerprint(video_path) != expected_fingerprint:
+        raise VideoValidationError("Input video changed during preflight")
+    return {**expected_fingerprint, "source_sha256": source_hash}
 
 
 def assert_source_unchanged(video_path: Path, expected_metadata: dict[str, Any]) -> None:
@@ -66,6 +85,7 @@ def validate_input_video(
         metadata.update(fingerprint)
         _validate_metadata(metadata, config)
         validate_media_decode(video_path, metadata, config)
+        metadata.update(_stable_source_metadata(video_path, fingerprint))
         return metadata
     return {
         "duration_seconds": None,
@@ -75,7 +95,7 @@ def validate_input_video(
         "audio_stream_count": None,
         "video_codec": None,
         "audio_codec": None,
-        **fingerprint,
+        **_stable_source_metadata(video_path, fingerprint),
     }
 
 

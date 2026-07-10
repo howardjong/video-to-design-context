@@ -1,5 +1,6 @@
 import json
 import subprocess
+from hashlib import sha256
 
 import pytest
 
@@ -193,6 +194,7 @@ def test_preflight_uses_bounded_full_decode_and_records_source_fingerprint(tmp_p
 
     assert metadata["source_mtime_ns"] == video.stat().st_mtime_ns
     assert metadata["file_size_bytes"] == video.stat().st_size
+    assert metadata["source_sha256"] == sha256(video.read_bytes()).hexdigest()
     ffmpeg_calls = [command for command in calls if command[0] == "ffmpeg"]
     assert any("0:v:0" in command and "0:a:0" in command for command in ffmpeg_calls)
     assert any("volumedetect" in command for command in ffmpeg_calls)
