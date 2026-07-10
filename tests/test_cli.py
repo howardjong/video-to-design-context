@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 from tastepack.cli import app, promote_output
 from tastepack.gemini import MOCK_ANALYSIS
 from tastepack.schema import TasteAnalysis
+from tastepack.video import source_fingerprint
 
 runner = CliRunner()
 
@@ -232,7 +233,6 @@ def test_out_of_video_gemini_analysis_fails_before_frame_extraction(tmp_path, mo
         "file_size_bytes": video.stat().st_size,
     }
     monkeypatch.setattr("tastepack.cli.validate_input_video", lambda *args, **kwargs: metadata)
-    monkeypatch.setattr("tastepack.cli.probe_duration_seconds", lambda *args, **kwargs: 10.0)
     monkeypatch.setattr(
         "tastepack.cli.analyze_video",
         lambda *args, **kwargs: TasteAnalysis.model_validate(MOCK_ANALYSIS),
@@ -254,6 +254,87 @@ def test_out_of_video_gemini_analysis_fails_before_frame_extraction(tmp_path, mo
     assert "Step: Analysis validation" in result.output
     assert "Asset range is outside video duration" in result.output
     assert not (tmp_path / "claude-pack").exists()
+
+
+def test_cli_reuses_the_first_video_preflight_instead_of_reprobing_duration(tmp_path, monkeypatch):
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"fake video")
+    metadata = {
+        "duration_seconds": 20.0,
+        "width": 1280,
+        "height": 720,
+        "video_stream_count": 1,
+        "audio_stream_count": 1,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        **source_fingerprint(video),
+    }
+    monkeypatch.setattr("tastepack.cli.validate_input_video", lambda *args, **kwargs: metadata)
+    monkeypatch.setattr(
+        "tastepack.cli.probe_duration_seconds",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not reprobe")),
+        raising=False,
+    )
+    monkeypatch.setattr("tastepack.cli.extract_frames", lambda *args, **kwargs: [])
+
+    result = runner.invoke(
+        app,
+        [
+            "process",
+            str(video),
+            "--out",
+            str(tmp_path / "claude-pack"),
+            "--mock-gemini",
+            "--no-pdf",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+
+
+def test_source_replacement_after_analysis_preserves_existing_output(tmp_path, monkeypatch):
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"video-before-preflight")
+    metadata = {
+        "duration_seconds": 20.0,
+        "width": 1280,
+        "height": 720,
+        "video_stream_count": 1,
+        "audio_stream_count": 1,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        **source_fingerprint(video),
+    }
+    output_dir = tmp_path / "claude-pack"
+    output_dir.mkdir()
+    previous_packet = output_dir / "taste_packet.md"
+    previous_packet.write_text("previous complete pack")
+    monkeypatch.setattr("tastepack.cli.validate_input_video", lambda *args, **kwargs: metadata)
+
+    def replace_source_during_analysis(*args, **kwargs):
+        video.write_bytes(b"video-replaced-after-gemini-analysis")
+        return TasteAnalysis.model_validate(MOCK_ANALYSIS)
+
+    monkeypatch.setattr("tastepack.cli.analyze_video", replace_source_during_analysis)
+
+    result = runner.invoke(
+        app,
+        [
+            "process",
+            str(video),
+            "--out",
+            str(output_dir),
+            "--mock-gemini",
+            "--skip-ffmpeg",
+            "--no-pdf",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Step: Frame extraction" in result.output
+    assert "changed after preflight" in result.output
+    assert previous_packet.read_text() == "previous complete pack"
+    assert not list(tmp_path.glob(".claude-pack.tmp-*"))
 
 
 def test_existing_output_directory_is_replaced_on_success(tmp_path):

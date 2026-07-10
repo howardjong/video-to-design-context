@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -15,6 +17,26 @@ class VideoValidationError(ValueError):
     """Raised when the input video or system dependencies are invalid."""
 
 
+def source_fingerprint(video_path: Path) -> dict[str, int]:
+    stat = video_path.stat()
+    return {
+        "file_size_bytes": stat.st_size,
+        "source_mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def assert_source_unchanged(video_path: Path, expected_metadata: dict[str, Any]) -> None:
+    expected_size = expected_metadata.get("file_size_bytes")
+    expected_mtime = expected_metadata.get("source_mtime_ns")
+    actual = source_fingerprint(video_path)
+    if actual["file_size_bytes"] != expected_size or actual["source_mtime_ns"] != expected_mtime:
+        raise VideoValidationError(
+            "Input video changed after preflight "
+            f"(size {expected_size} -> {actual['file_size_bytes']}, "
+            f"mtime {expected_mtime} -> {actual['source_mtime_ns']})"
+        )
+
+
 def validate_input_video(
     video_path: Path,
     require_tools: bool = True,
@@ -27,7 +49,10 @@ def validate_input_video(
             f"Unsupported video extension: {video_path.suffix}. Expected .mp4 or .mov"
         )
     config = config or TastepackConfig()
-    file_size = video_path.stat().st_size
+    if video_path.is_symlink() or not video_path.is_file():
+        raise VideoValidationError(f"Input video is not a regular file: {video_path}")
+    fingerprint = source_fingerprint(video_path)
+    file_size = fingerprint["file_size_bytes"]
     if file_size > config.max_file_size_bytes:
         raise VideoValidationError(
             f"Input video is larger than the Gemini Files API limit "
@@ -37,9 +62,10 @@ def validate_input_video(
         missing = [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
         if missing:
             raise VideoValidationError(f"Missing required system dependency: {', '.join(missing)}")
-        metadata = probe_video_metadata(video_path)
-        metadata["file_size_bytes"] = file_size
+        metadata = probe_video_metadata(video_path, config.ffprobe_timeout_seconds)
+        metadata.update(fingerprint)
         _validate_metadata(metadata, config)
+        validate_media_decode(video_path, metadata, config)
         return metadata
     return {
         "duration_seconds": None,
@@ -49,13 +75,19 @@ def validate_input_video(
         "audio_stream_count": None,
         "video_codec": None,
         "audio_codec": None,
-        "file_size_bytes": file_size,
+        **fingerprint,
     }
 
 
 def _validate_metadata(metadata: dict[str, Any], config: TastepackConfig) -> None:
     duration = metadata.get("duration_seconds")
-    if duration is None or duration <= 0:
+    if (
+        not isinstance(duration, (int, float))
+        or isinstance(duration, bool)
+        or not math.isfinite(duration)
+    ):
+        raise VideoValidationError("Input video has an invalid duration")
+    if duration <= 0:
         raise VideoValidationError("Input video has no positive duration")
     if duration > config.max_duration_seconds:
         raise VideoValidationError(
@@ -64,13 +96,30 @@ def _validate_metadata(metadata: dict[str, Any], config: TastepackConfig) -> Non
         )
     if not metadata.get("video_stream_count"):
         raise VideoValidationError("Input file has no video stream")
+    width = metadata.get("width")
+    height = metadata.get("height")
+    if (
+        not isinstance(width, int)
+        or isinstance(width, bool)
+        or width <= 0
+        or not isinstance(height, int)
+        or isinstance(height, bool)
+        or height <= 0
+    ):
+        raise VideoValidationError("Input video has invalid dimensions")
+    if not isinstance(metadata.get("video_codec"), str) or not metadata["video_codec"].strip():
+        raise VideoValidationError("Input video has no usable video codec")
     if not metadata.get("audio_stream_count") and not config.allow_no_audio:
         raise VideoValidationError(
             "Input video has no audio stream. Use --allow-no-audio for visual-only runs."
         )
+    if metadata.get("audio_stream_count") and (
+        not isinstance(metadata.get("audio_codec"), str) or not metadata["audio_codec"].strip()
+    ):
+        raise VideoValidationError("Input video has no usable audio codec")
 
 
-def probe_video_metadata(video_path: Path) -> dict[str, Any]:
+def probe_video_metadata(video_path: Path, timeout_seconds: float = 30.0) -> dict[str, Any]:
     command = [
         "ffprobe",
         "-v",
@@ -83,7 +132,18 @@ def probe_video_metadata(video_path: Path) -> dict[str, Any]:
         "json",
         str(video_path),
     ]
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise VideoValidationError(
+            f"ffprobe timed out after {timeout_seconds:.1f}s while inspecting input video"
+        ) from exc
     if completed.returncode != 0:
         message = completed.stderr.strip() or "ffprobe failed"
         raise VideoValidationError(f"Could not inspect video with ffprobe: {message}")
@@ -114,8 +174,84 @@ def probe_video_metadata(video_path: Path) -> dict[str, Any]:
     }
 
 
-def probe_duration_seconds(video_path: Path) -> float | None:
+def _run_ffmpeg_validation(
+    command: list[str],
+    timeout_seconds: float,
+    label: str,
+) -> subprocess.CompletedProcess[str]:
     try:
-        return probe_video_metadata(video_path)["duration_seconds"]
-    except VideoValidationError:
-        return None
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise VideoValidationError(f"{label} timed out after {timeout_seconds:.1f}s") from exc
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip() or "no ffmpeg diagnostics"
+        raise VideoValidationError(f"{label} failed: {stderr}")
+    return completed
+
+
+def validate_media_decode(
+    video_path: Path,
+    metadata: dict[str, Any],
+    config: TastepackConfig,
+) -> None:
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-xerror",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:v:0",
+    ]
+    if metadata.get("audio_stream_count") and not config.allow_no_audio:
+        command.extend(["-map", "0:a:0"])
+    command.extend(["-f", "null", "-"])
+    _run_ffmpeg_validation(
+        command,
+        config.ffmpeg_timeout_seconds,
+        "Full media decode validation",
+    )
+
+    if metadata.get("audio_stream_count") and not config.allow_no_audio:
+        loudness_command = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-v",
+            "info",
+            "-i",
+            str(video_path),
+            "-map",
+            "0:a:0",
+            "-af",
+            "volumedetect",
+            "-f",
+            "null",
+            "-",
+        ]
+        completed = _run_ffmpeg_validation(
+            loudness_command,
+            config.ffmpeg_timeout_seconds,
+            "Audio loudness validation",
+        )
+        match = re.search(r"mean_volume:\s*(-?(?:\d+(?:\.\d+)?|inf))\s*dB", completed.stderr)
+        if not match:
+            raise VideoValidationError("Could not determine audio loudness during preflight")
+        volume_text = match.group(1)
+        mean_volume = -math.inf if volume_text == "-inf" else float(volume_text)
+        metadata["audio_mean_volume_db"] = mean_volume
+        if mean_volume < config.min_audio_mean_volume_db:
+            raise VideoValidationError(
+                "Input audio is effectively silent "
+                f"({mean_volume:.1f} dB < {config.min_audio_mean_volume_db:.1f} dB). "
+                "Use --allow-no-audio only for intentionally visual-only runs."
+            )
+    else:
+        metadata["audio_mean_volume_db"] = None

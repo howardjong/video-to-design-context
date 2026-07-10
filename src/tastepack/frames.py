@@ -10,6 +10,7 @@ from PIL import Image, UnidentifiedImageError
 from tastepack.config import TastepackConfig
 from tastepack.logging import get_logger
 from tastepack.schema import AssetExample, SuggestedFrame, TasteAnalysis
+from tastepack.video import VideoValidationError, assert_source_unchanged
 
 
 class FrameExtractionError(RuntimeError):
@@ -216,7 +217,14 @@ def extract_frames(
     frames: list[SuggestedFrame],
     output_dir: Path,
     skip_ffmpeg: bool = False,
+    expected_source_metadata: dict[str, object] | None = None,
+    ffmpeg_timeout_seconds: float = 30.0,
 ) -> list[ExtractedFrame]:
+    if expected_source_metadata is not None:
+        try:
+            assert_source_unchanged(video_path, expected_source_metadata)
+        except VideoValidationError as exc:
+            raise FrameExtractionError(str(exc)) from exc
     frames_dir = output_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
     extracted_frames: list[ExtractedFrame] = []
@@ -231,7 +239,20 @@ def extract_frames(
         else:
             command = build_ffmpeg_extract_command(video_path, frame.timestamp_seconds, destination)
             logger.debug("Running ffmpeg frame extraction command: %s", command)
-            completed = subprocess.run(command, capture_output=True, text=True, check=False)
+            try:
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=ffmpeg_timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise FrameExtractionError(
+                    "ffmpeg timed out while extracting frame "
+                    f"at {frame.timestamp_seconds:.3f}s to {relative_path} "
+                    f"after {ffmpeg_timeout_seconds:.1f}s"
+                ) from exc
             if completed.returncode != 0:
                 stderr = completed.stderr.strip() or "no stderr"
                 raise FrameExtractionError(

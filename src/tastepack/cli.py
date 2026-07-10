@@ -13,7 +13,7 @@ from tastepack.frames import extract_frames, select_frames_for_analysis
 from tastepack.gemini import GeminiAnalysisError, analyze_video
 from tastepack.logging import configure_logging, get_logger, redact_secrets
 from tastepack.schema import TasteAnalysis
-from tastepack.video import VideoValidationError, probe_duration_seconds, validate_input_video
+from tastepack.video import VideoValidationError, validate_input_video
 
 app = typer.Typer(help="Create Claude-ready design taste context packs from narrated videos.")
 logger = get_logger("cli")
@@ -182,11 +182,9 @@ def process(
                 config=config,
             ),
         )
-        duration = run_step(
-            "Video duration probe",
-            "Re-export the video if ffprobe cannot read its duration.",
-            lambda: None if skip_ffmpeg else probe_duration_seconds(input_video),
-        )
+        duration = video_metadata.get("duration_seconds")
+        if not isinstance(duration, int | float) or isinstance(duration, bool):
+            duration = None
         analysis = run_step(
             "Gemini analysis",
             "Fix the Gemini response/schema issue or retry after resolving API availability.",
@@ -231,6 +229,8 @@ def process(
                 selected_frames,
                 staging_dir,
                 skip_ffmpeg=skip_ffmpeg,
+                expected_source_metadata=video_metadata,
+                ffmpeg_timeout_seconds=config.frame_extraction_timeout_seconds,
             ),
         )
         run_step(

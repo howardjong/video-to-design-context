@@ -19,6 +19,10 @@ class TastepackConfig(BaseModel):
     max_duration_seconds: float = Field(default=1800.0, gt=0)
     max_file_size_bytes: int = Field(default=2_147_483_648, gt=0)
     allow_no_audio: bool = False
+    ffprobe_timeout_seconds: float = Field(default=30.0, gt=0)
+    ffmpeg_timeout_seconds: float = Field(default=600.0, gt=0)
+    frame_extraction_timeout_seconds: float = Field(default=30.0, gt=0)
+    min_audio_mean_volume_db: float = Field(default=-60.0, le=0)
     gemini_max_retries: int = Field(default=3, ge=1)
     gemini_retry_base_delay_seconds: float = Field(default=1.0, gt=0)
     gemini_retry_jitter_seconds: float = Field(default=0.25, ge=0)

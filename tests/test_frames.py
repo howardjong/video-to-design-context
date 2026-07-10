@@ -7,6 +7,7 @@ from PIL import Image
 
 from tastepack.config import TastepackConfig
 from tastepack.frames import (
+    FrameExtractionError,
     build_fallback_frames,
     build_ffmpeg_extract_command,
     extract_frames,
@@ -15,6 +16,7 @@ from tastepack.frames import (
     select_frames_for_analysis,
 )
 from tastepack.schema import AssetExample, SuggestedFrame, TasteAnalysis
+from tastepack.video import source_fingerprint
 
 
 def analysis_with_frames(frame_timestamps):
@@ -255,7 +257,7 @@ def test_frame_extraction_writes_expected_files(tmp_path, monkeypatch):
     video.write_bytes(b"fake")
     frame = SuggestedFrame(asset_id="asset 1", timestamp="00:00:03", reason="test", confidence=0.9)
 
-    def fake_run(command, capture_output, text, check):
+    def fake_run(command, capture_output, text, check, timeout):
         Image.new("RGB", (1, 1), "white").save(Path(command[-1]), format="JPEG")
 
         class Completed:
@@ -289,6 +291,23 @@ def test_frame_extraction_preserves_frames_from_different_assets_at_same_timesta
     assert len({frame.relative_path for frame in extracted}) == 2
 
 
+def test_frame_extraction_rejects_a_source_file_replaced_after_preflight(tmp_path):
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"before-preflight")
+    expected_metadata = source_fingerprint(video)
+    video.write_bytes(b"different-source-after-preflight")
+    frame = SuggestedFrame(asset_id="asset", timestamp="00:00:03", reason="test", confidence=0.9)
+
+    with pytest.raises(FrameExtractionError, match="changed after preflight"):
+        extract_frames(
+            video,
+            [frame],
+            tmp_path / "pack",
+            skip_ffmpeg=True,
+            expected_source_metadata=expected_metadata,
+        )
+
+
 def test_frame_filenames_do_not_collide_for_distinct_sanitized_asset_ids(tmp_path):
     video = tmp_path / "input.mp4"
     video.write_bytes(b"fake")
@@ -307,7 +326,7 @@ def test_frame_extraction_fails_when_ffmpeg_writes_no_file(tmp_path, monkeypatch
     video.write_bytes(b"fake")
     frame = SuggestedFrame(asset_id="asset", timestamp="00:00:03", reason="test", confidence=0.9)
 
-    def fake_run(command, capture_output, text, check):
+    def fake_run(command, capture_output, text, check, timeout):
         class Completed:
             returncode = 0
             stderr = ""
@@ -325,7 +344,7 @@ def test_frame_extraction_failure_includes_timestamp_output_and_stderr(tmp_path,
     video.write_bytes(b"fake")
     frame = SuggestedFrame(asset_id="asset", timestamp="00:00:03", reason="test", confidence=0.9)
 
-    def fake_run(command, capture_output, text, check):
+    def fake_run(command, capture_output, text, check, timeout):
         class Completed:
             returncode = 1
             stderr = "invalid seek"
@@ -349,7 +368,7 @@ def test_frame_extraction_fails_when_ffmpeg_writes_empty_file(tmp_path, monkeypa
     video.write_bytes(b"fake")
     frame = SuggestedFrame(asset_id="asset", timestamp="00:00:03", reason="test", confidence=0.9)
 
-    def fake_run(command, capture_output, text, check):
+    def fake_run(command, capture_output, text, check, timeout):
         Path(command[-1]).write_bytes(b"")
 
         class Completed:
@@ -369,7 +388,7 @@ def test_frame_extraction_fails_when_ffmpeg_writes_an_invalid_jpeg(tmp_path, mon
     video.write_bytes(b"fake")
     frame = SuggestedFrame(asset_id="asset", timestamp="00:00:03", reason="test", confidence=0.9)
 
-    def fake_run(command, capture_output, text, check):
+    def fake_run(command, capture_output, text, check, timeout):
         Path(command[-1]).write_bytes(b"not a jpeg")
 
         class Completed:
@@ -382,6 +401,25 @@ def test_frame_extraction_fails_when_ffmpeg_writes_an_invalid_jpeg(tmp_path, mon
 
     with pytest.raises(Exception, match="invalid JPEG"):
         extract_frames(video, [frame], tmp_path / "pack")
+
+
+def test_frame_extraction_timeout_reports_frame_context(tmp_path, monkeypatch):
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"fake")
+    frame = SuggestedFrame(asset_id="asset", timestamp="00:00:03", reason="test", confidence=0.9)
+
+    def timeout_run(command, capture_output, text, check, timeout):
+        raise subprocess.TimeoutExpired(command, timeout)
+
+    monkeypatch.setattr("tastepack.frames.subprocess.run", timeout_run)
+
+    with pytest.raises(FrameExtractionError, match=r"timed out.*3\.000.*after 0\.1s"):
+        extract_frames(
+            video,
+            [frame],
+            tmp_path / "pack",
+            ffmpeg_timeout_seconds=0.1,
+        )
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
