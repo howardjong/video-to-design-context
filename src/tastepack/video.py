@@ -275,3 +275,51 @@ def validate_media_decode(
             )
     else:
         metadata["audio_mean_volume_db"] = None
+
+
+def mux_video_with_companion_audio(
+    video_path: Path,
+    audio_path: Path,
+    output_path: Path,
+    config: TastepackConfig,
+) -> None:
+    """Create and fully validate the one MP4 sent to Gemini for a sidecar-audio bundle."""
+    if audio_path.is_symlink() or not audio_path.is_file():
+        raise VideoValidationError(f"Companion audio is not a regular file: {audio_path.name}")
+    missing = [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
+    if missing:
+        raise VideoValidationError(f"Missing required system dependency: {', '.join(missing)}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _run_ffmpeg_validation(
+            [
+                "ffmpeg",
+                "-y",
+                "-v",
+                "error",
+                "-xerror",
+                "-i",
+                str(video_path),
+                "-i",
+                str(audio_path),
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                str(output_path),
+            ],
+            config.ffmpeg_timeout_seconds,
+            "Companion audio mux",
+        )
+        if not output_path.is_file() or output_path.stat().st_size == 0:
+            raise VideoValidationError("Companion audio mux produced no analysis MP4")
+        validate_input_video(output_path, config=config)
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        raise

@@ -145,10 +145,12 @@ def run_processing_job(
     precomputed_provider_metadata: dict[str, object] | None = None,
     lifecycle_callback: LifecycleCallback | None = None,
     dependencies: PipelineDependencies | None = None,
+    analysis_video: Path | None = None,
 ) -> PipelineResult:
     dependencies = dependencies or PipelineDependencies(promote_output=promote_output)
     promote = dependencies.promote_output or promote_output
     staging_dir: Path | None = None
+    provider_video = analysis_video or input_video
 
     def emit_lifecycle(state: str, payload: dict[str, Any]) -> None:
         if lifecycle_callback is None:
@@ -193,7 +195,7 @@ def run_processing_job(
                 with context:
                     emit_lifecycle("gemini_started", {})
                     return dependencies.analyze_video(
-                        input_video,
+                        provider_video,
                         config,
                         mock=mock_gemini,
                         mock_payload_path=mock_payload,

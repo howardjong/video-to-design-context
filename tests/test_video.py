@@ -5,7 +5,11 @@ from hashlib import sha256
 import pytest
 
 from tastepack.config import TastepackConfig
-from tastepack.video import VideoValidationError, validate_input_video
+from tastepack.video import (
+    VideoValidationError,
+    mux_video_with_companion_audio,
+    validate_input_video,
+)
 
 
 def test_video_validation_rejects_missing_files(tmp_path):
@@ -314,3 +318,54 @@ def test_decode_failure_and_silent_audio_are_rejected_unless_visual_only(tmp_pat
         config=TastepackConfig(allow_no_audio=True),
     )
     assert visual_only_metadata["audio_mean_volume_db"] is None
+
+
+def test_companion_audio_mux_creates_one_validated_mp4(tmp_path, monkeypatch):
+    video = tmp_path / "walkthrough.mp4"
+    audio = tmp_path / "narration.mp3"
+    output = tmp_path / "analysis-input.mp4"
+    video.write_bytes(b"video")
+    audio.write_bytes(b"audio")
+    commands = []
+    validated_paths = []
+
+    monkeypatch.setattr("tastepack.video.shutil.which", lambda tool: f"/usr/bin/{tool}")
+
+    def fake_run(command, capture_output, text, check, timeout):
+        commands.append(command)
+        output.write_bytes(b"muxed mp4")
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr("tastepack.video.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "tastepack.video.validate_input_video",
+        lambda path, **_kwargs: validated_paths.append(path),
+    )
+
+    mux_video_with_companion_audio(video, audio, output, TastepackConfig())
+
+    assert validated_paths == [output]
+    assert commands == [
+        [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-xerror",
+            "-i",
+            str(video),
+            "-i",
+            str(audio),
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ]
+    ]

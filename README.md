@@ -142,7 +142,10 @@ directly inside `inbox/` and must contain exactly one `.mp4` or `.mov` video,
 including in nested folders. Its name becomes the output source name. Other files,
 such as a narrated `.mp3` and timestamped `.md` transcript, are retained as local
 companions: they are recorded in the job manifest and move with the bundle to
-`archive/` or `failed/<job-id>/`, but only the selected video is sent to Gemini.
+`archive/` or `failed/<job-id>/`. When a video fails only the audio requirement and
+the bundle has exactly one MP3 companion, tastepack privately muxes the video stream
+with that narration and sends the resulting single MP4 to Gemini. The MP3 and
+Markdown are never sent as separate Gemini inputs.
 
 For example:
 

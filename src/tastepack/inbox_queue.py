@@ -25,7 +25,12 @@ from tastepack.gemini import GEMINI_PROMPT_VERSION, GEMINI_SCHEMA_VERSION
 from tastepack.logging import get_logger, job_log_context, redact_secrets
 from tastepack.pipeline import FailureCategory, PipelineFailure, run_processing_job
 from tastepack.schema import TasteAnalysis
-from tastepack.video import VideoValidationError, validate_input_video
+from tastepack.video import (
+    VideoValidationError,
+    mux_video_with_companion_audio,
+    source_sha256,
+    validate_input_video,
+)
 
 logger = get_logger("inbox")
 SUPPORTED_EXTENSIONS = {".mp4", ".mov"}
@@ -566,12 +571,22 @@ def _resolve_claimed_video(
         )
 
     video = videos[0]
+    audio_companions = [path for path in files if path.suffix.lower() == ".mp3"]
     return video, {
         "source_video_name": video.name,
         "source_video_relative_path": video.relative_to(claimed_input).as_posix(),
         "companion_assets": [
             path.relative_to(claimed_input).as_posix() for path in files if path != video
         ],
+        **(
+            {
+                "companion_audio_relative_path": audio_companions[0]
+                .relative_to(claimed_input)
+                .as_posix()
+            }
+            if len(audio_companions) == 1
+            else {}
+        ),
     }
 
 
@@ -595,7 +610,29 @@ def _process_claimed_job(
         manifest.update(bundle_metadata)
         manifest["claimed_path"] = str(claimed_path.relative_to(paths.processing))
         _write_manifest(paths, manifest)
-    video_metadata = preflight(claimed_path, require_tools=not skip_ffmpeg, config=config)
+    analysis_video: Path | None = None
+    try:
+        video_metadata = preflight(claimed_path, require_tools=not skip_ffmpeg, config=config)
+    except VideoValidationError:
+        companion_audio_relative_path = manifest.get("companion_audio_relative_path")
+        if not isinstance(companion_audio_relative_path, str) or config.allow_no_audio:
+            raise
+        companion_audio = _claimed_input_path(paths, manifest) / companion_audio_relative_path
+        audio_optional_config = config.model_copy(update={"allow_no_audio": True})
+        video_metadata = preflight(
+            claimed_path,
+            require_tools=not skip_ffmpeg,
+            config=audio_optional_config,
+        )
+        analysis_video = _claimed_input_path(paths, manifest).parent / "analysis-input.mp4"
+        mux_video_with_companion_audio(claimed_path, companion_audio, analysis_video, config)
+        manifest["analysis_input"] = {
+            "kind": "muxed_mp4_with_companion_audio",
+            "source_video_relative_path": manifest["source_video_relative_path"],
+            "companion_audio_relative_path": companion_audio_relative_path,
+            "companion_audio_sha256": source_sha256(companion_audio),
+        }
+        _write_manifest(paths, manifest)
     source_hash = video_metadata.get("source_sha256")
     if not isinstance(source_hash, str) or not source_hash:
         raise PipelineFailure(
@@ -605,7 +642,15 @@ def _process_claimed_job(
             FailureCategory.SYSTEM,
         )
     fingerprint = config_fingerprint(config)
-    run_key = hashlib.sha256(f"{source_hash}:{fingerprint}".encode()).hexdigest()
+    companion_audio_hash = (
+        manifest.get("analysis_input", {}).get("companion_audio_sha256")
+        if isinstance(manifest.get("analysis_input"), dict)
+        else None
+    )
+    run_key_material = f"{source_hash}:{fingerprint}"
+    if isinstance(companion_audio_hash, str):
+        run_key_material += f":companion-audio:{companion_audio_hash}"
+    run_key = hashlib.sha256(run_key_material.encode()).hexdigest()
     output_name = f"{_safe_stem(_output_stem(manifest))}--{run_key[:12]}"
     if snapshot is not None and manifest.get("run_key") != run_key:
         raise PipelineFailure(
@@ -661,23 +706,28 @@ def _process_claimed_job(
         if state == "output_promoted":
             _transition(paths, manifest, "output_promoted")
 
+    runner_kwargs: dict[str, Any] = {
+        "mock_gemini": mock_gemini,
+        "mock_payload": mock_payload,
+        "skip_ffmpeg": skip_ffmpeg,
+        "preflight_metadata": video_metadata,
+        "gemini_permit": gemini_permit,
+        "retry_observer": retry_observer,
+        "lifecycle_callback": persist_lifecycle,
+        "precomputed_analysis": (
+            TasteAnalysis.model_validate(snapshot["analysis"]) if snapshot is not None else None
+        ),
+        "precomputed_provider_metadata": (
+            snapshot.get("provider_metadata") if snapshot is not None else None
+        ),
+    }
+    if analysis_video is not None:
+        runner_kwargs["analysis_video"] = analysis_video
     runner(
         claimed_path,
         output_dir,
         config,
-        mock_gemini=mock_gemini,
-        mock_payload=mock_payload,
-        skip_ffmpeg=skip_ffmpeg,
-        preflight_metadata=video_metadata,
-        gemini_permit=gemini_permit,
-        retry_observer=retry_observer,
-        lifecycle_callback=persist_lifecycle,
-        precomputed_analysis=(
-            TasteAnalysis.model_validate(snapshot["analysis"]) if snapshot is not None else None
-        ),
-        precomputed_provider_metadata=(
-            snapshot.get("provider_metadata") if snapshot is not None else None
-        ),
+        **runner_kwargs,
     )
     if not _is_complete_pack(output_dir, source_hash):
         raise PipelineFailure(
@@ -901,6 +951,8 @@ def _annotate_pack(output_dir: Path, manifest: dict[str, Any]) -> None:
         "run_key": manifest["run_key"],
         "config_fingerprint": manifest["config_fingerprint"],
     }
+    if isinstance(manifest.get("analysis_input"), dict):
+        payload["queue"]["analysis_input"] = manifest["analysis_input"]
     _atomic_write_json(metadata_path, payload)
     validate_complete_metadata(output_dir)
 

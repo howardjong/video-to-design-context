@@ -119,6 +119,63 @@ def test_inbox_processes_asset_bundle_and_archives_all_companions(tmp_path: Path
     assert not (archived_bundle / "analysis-snapshot.json").exists()
 
 
+def test_silent_bundle_uses_companion_audio_in_one_private_analysis_mp4(
+    tmp_path: Path, monkeypatch
+) -> None:
+    intake = tmp_path / "tastepack-data"
+    paths = IntakePaths.from_root(intake)
+    paths.ensure()
+    bundle = paths.inbox / "silent-video"
+    bundle.mkdir()
+    (bundle / "walkthrough.mp4").write_bytes(b"silent video")
+    (bundle / "narration.mp3").write_bytes(b"audible narration")
+    (bundle / "transcript.md").write_text("[00:00.000] Hello\n", encoding="utf-8")
+    preflight_allow_no_audio: list[bool] = []
+    received_analysis_videos: list[Path] = []
+
+    def preflight(path: Path, *, config: TastepackConfig, **_kwargs):
+        preflight_allow_no_audio.append(config.allow_no_audio)
+        if not config.allow_no_audio:
+            raise VideoValidationError("Input audio is effectively silent")
+        return {"source_sha256": "video-hash", "duration_seconds": 5.0}
+
+    def fake_mux(video: Path, audio: Path, output: Path, _config: TastepackConfig) -> None:
+        assert video.name == "walkthrough.mp4"
+        assert audio.name == "narration.mp3"
+        output.write_bytes(b"single analysis mp4")
+
+    monkeypatch.setattr("tastepack.inbox_queue.mux_video_with_companion_audio", fake_mux)
+
+    def runner(path: Path, out: Path, _config: TastepackConfig, **kwargs):
+        assert path.name == "walkthrough.mp4"
+        received_analysis_videos.append(kwargs["analysis_video"])
+        write_complete_pack(out, "video-hash")
+
+    summary = process_inbox(
+        intake,
+        TastepackConfig(produce_pdf=False),
+        stable_seconds=0,
+        preflight=preflight,
+        runner=runner,
+    )
+
+    assert summary.completed == 1
+    assert preflight_allow_no_audio == [False, True]
+    assert received_analysis_videos[0].name == "analysis-input.mp4"
+    job = summary.jobs[0]
+    assert job["analysis_input"] == {
+        "kind": "muxed_mp4_with_companion_audio",
+        "source_video_relative_path": "walkthrough.mp4",
+        "companion_audio_relative_path": "narration.mp3",
+        "companion_audio_sha256": (
+            "a61edb7887d61ebc0bc75c7e3f9944268a35a02a506b18f254063447d3c9878c"
+        ),
+    }
+    assert not list(paths.archive.rglob("analysis-input.mp4"))
+    metadata = json.loads((paths.output / job["output_path"] / "metadata.json").read_text())
+    assert metadata["queue"]["analysis_input"] == job["analysis_input"]
+
+
 def test_invalid_asset_bundle_moves_entire_bundle_to_failed_and_continues(tmp_path: Path) -> None:
     intake = tmp_path / "tastepack-data"
     paths = IntakePaths.from_root(intake)

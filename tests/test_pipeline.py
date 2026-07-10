@@ -63,6 +63,41 @@ def test_pipeline_returns_structured_result_without_importing_cli(tmp_path: Path
     assert result.analysis.model_dump() == analysis.model_dump()
 
 
+def test_pipeline_uses_private_analysis_video_but_extracts_source_frames(tmp_path: Path) -> None:
+    input_video = tmp_path / "source.mp4"
+    analysis_video = tmp_path / "analysis-input.mp4"
+    input_video.write_bytes(b"source")
+    analysis_video.write_bytes(b"muxed")
+    analysis = TasteAnalysis.model_validate(MOCK_ANALYSIS)
+    analyzed_paths: list[Path] = []
+    extracted_paths: list[Path] = []
+    dependencies = PipelineDependencies(
+        validate_input_video=lambda *_args, **_kwargs: {
+            "duration_seconds": 20.0,
+            "source_sha256": "source-hash",
+        },
+        analyze_video=lambda path, *_args, **_kwargs: (
+            analyzed_paths.append(path) or analysis
+        ),
+        select_frames_for_analysis=lambda *_args, **_kwargs: [object()],
+        extract_frames=lambda path, *_args, **_kwargs: extracted_paths.append(path) or [],
+        generate_artifacts=lambda *_args, **_kwargs: None,
+    )
+
+    run_processing_job(
+        input_video,
+        tmp_path / "pack",
+        TastepackConfig(produce_pdf=False),
+        mock_gemini=True,
+        skip_ffmpeg=True,
+        analysis_video=analysis_video,
+        dependencies=dependencies,
+    )
+
+    assert analyzed_paths == [analysis_video]
+    assert extracted_paths == [input_video]
+
+
 def test_pipeline_emits_validated_analysis_before_artifact_work(tmp_path: Path) -> None:
     input_video = tmp_path / "input.mp4"
     input_video.write_bytes(b"fake-video")
