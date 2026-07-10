@@ -56,6 +56,33 @@ def test_cli_accepts_video_and_output_directory_in_mock_mode(tmp_path):
     assert json.loads((output_dir / "metadata.json").read_text())["source_video"] == video.name
 
 
+def test_cli_processes_inbox_in_mock_mode(tmp_path):
+    data_dir = tmp_path / "tastepack-data"
+    inbox = data_dir / "inbox"
+    inbox.mkdir(parents=True)
+    (inbox / "input.mp4").write_bytes(b"fake video for mocked mode")
+
+    result = runner.invoke(
+        app,
+        [
+            "process-inbox",
+            "--data-dir",
+            str(data_dir),
+            "--mock-gemini",
+            "--skip-ffmpeg",
+            "--no-pdf",
+            "--stable-seconds",
+            "0",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(list((data_dir / "archive").rglob("input.mp4"))) == 1
+    outputs = list((data_dir / "output").glob("*/metadata.json"))
+    assert len(outputs) == 1
+    assert json.loads(outputs[0].read_text())["queue"]["run_key"]
+
+
 def test_skip_ffmpeg_requires_mock_gemini(tmp_path):
     video = tmp_path / "input.mp4"
     video.write_bytes(b"not a decodable video")

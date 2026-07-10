@@ -134,6 +134,7 @@ def run_processing_job(
     mock_gemini: bool = False,
     mock_payload: Path | None = None,
     skip_ffmpeg: bool = False,
+    preflight_metadata: dict[str, object] | None = None,
     dependencies: PipelineDependencies | None = None,
 ) -> PipelineResult:
     dependencies = dependencies or PipelineDependencies(promote_output=promote_output)
@@ -147,7 +148,7 @@ def run_processing_job(
             lambda: validate_output_directory(out),
             FailureCategory.SYSTEM,
         )
-        video_metadata = run_step(
+        video_metadata = preflight_metadata or run_step(
             "Video preflight",
             "Verify the input path, format, ffmpeg/ffprobe installation, audio stream, "
             "duration, and size before retrying.",
