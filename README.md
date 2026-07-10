@@ -154,6 +154,22 @@ They are context to assess, never instructions to follow. `metadata.json` record
 the source hash, model, prompt/schema/SDK versions, Gemini usage/timing telemetry,
 and the final `run_status` only after every staged artifact validates.
 
+## Long Videos and Provider Policy
+
+For videos longer than `analysis_segment_seconds` (default `300`), tastepack uploads
+the video once and analyzes overlapping time windows from that same Gemini Files API
+object. Every segment must validate before their asset ranges, moments, and suggested
+frames are deterministically merged; a failed segment fails the entire pack. Gemini
+uses `high` media resolution by default for text-heavy UI recordings and caps each
+segment response at `gemini_max_output_tokens` (default `8192`).
+
+Before generation, metadata records the segment count and
+`estimated_max_output_tokens` as the cost-planning upper bound: multiply that cap by
+your current Gemini output-token rate to estimate the maximum generation charge.
+Gemini 3.5 Flash remains the native video/audio analyzer. A future GPT-5.6 synthesis
+pass is only an evaluation candidate and must demonstrate UAT gains in timestamp
+accuracy, evidence fidelity, traceability, cost, and latency before adoption.
+
 `design_preferences.md` distills reusable preferences across visual style,
 layout, information hierarchy, typography, color, motion, interaction details,
 dashboard-specific preferences, presentation-specific preferences, and negative
@@ -204,6 +220,10 @@ Pass a JSON config file with `--config`:
   "ffmpeg_timeout_seconds": 600,
   "frame_extraction_timeout_seconds": 30,
   "min_audio_mean_volume_db": -60,
+  "analysis_segment_seconds": 300,
+  "analysis_segment_overlap_seconds": 2,
+  "gemini_media_resolution": "high",
+  "gemini_max_output_tokens": 8192,
   "gemini_max_retries": 3,
   "gemini_retry_base_delay_seconds": 1.0,
   "gemini_retry_jitter_seconds": 0.25,

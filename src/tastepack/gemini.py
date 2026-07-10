@@ -19,6 +19,7 @@ from pydantic import ValidationError
 from tastepack.config import TastepackConfig
 from tastepack.logging import get_logger, redact_secrets
 from tastepack.schema import TasteAnalysis
+from tastepack.segments import VideoSegment, build_segment_plan, merge_segment_analyses
 
 
 class GeminiAnalysisError(RuntimeError):
@@ -35,6 +36,7 @@ class GeminiRunTelemetry:
     finish_reason: str | None = None
     token_usage: dict[str, int] = field(default_factory=dict)
     total_duration_seconds: float | None = None
+    analysis_plan: dict[str, Any] = field(default_factory=dict)
 
     def record_attempt(self, operation_name: str) -> None:
         self.operation_attempts[operation_name] = self.operation_attempts.get(operation_name, 0) + 1
@@ -52,6 +54,7 @@ class GeminiRunTelemetry:
             "finish_reason": self.finish_reason,
             "token_usage": self.token_usage,
             "total_duration_seconds": self.total_duration_seconds,
+            "analysis_plan": self.analysis_plan,
         }
 
 
@@ -224,10 +227,7 @@ def call_with_retries(
             if (
                 attempt >= config.gemini_max_retries
                 or not _is_retryable_error(exc)
-                or (
-                    not retry_ambiguous_transport_errors
-                    and _is_ambiguous_transport_error(exc)
-                )
+                or (not retry_ambiguous_transport_errors and _is_ambiguous_transport_error(exc))
             ):
                 raise
             delay = _retry_after_seconds(exc)
@@ -262,9 +262,9 @@ def call_with_telemetry(
             operation_name=operation_name,
             retry_ambiguous_transport_errors=retry_ambiguous_transport_errors,
             on_attempt=(
-                lambda _attempt: telemetry.record_attempt(operation_name)
-                if telemetry is not None
-                else None
+                lambda _attempt: (
+                    telemetry.record_attempt(operation_name) if telemetry is not None else None
+                )
             ),
         )
     finally:
@@ -356,8 +356,14 @@ def build_generation_config(config: TastepackConfig | None = None) -> Any:
     from google.genai import types
 
     config = config or TastepackConfig()
+    media_resolution = getattr(
+        types.MediaResolution,
+        f"MEDIA_RESOLUTION_{config.gemini_media_resolution.upper()}",
+    )
     return types.GenerateContentConfig(
         http_options=build_http_options(config.gemini_generation_timeout_seconds),
+        media_resolution=media_resolution,
+        max_output_tokens=config.gemini_max_output_tokens,
         response_mime_type="application/json",
         response_schema=TasteAnalysis,
     )
@@ -383,10 +389,52 @@ def _record_response_telemetry(response: Any, telemetry: GeminiRunTelemetry | No
     ):
         value = getattr(usage_metadata, field_name, None)
         if isinstance(value, int) and not isinstance(value, bool):
-            telemetry.token_usage[field_name] = value
+            telemetry.token_usage[field_name] = telemetry.token_usage.get(field_name, 0) + value
     candidates = getattr(response, "candidates", None) or []
     if candidates:
         telemetry.finish_reason = _value_name(getattr(candidates[0], "finish_reason", None))
+
+
+def _segment_contents(active_file: Any, segment: VideoSegment) -> list[Any]:
+    from google.genai import types
+
+    file_uri = getattr(active_file, "uri", None)
+    mime_type = getattr(active_file, "mime_type", None)
+    if not file_uri or not mime_type:
+        raise GeminiAnalysisError("Gemini uploaded file did not provide a URI and MIME type")
+    video_part = types.Part(
+        file_data=types.FileData(file_uri=file_uri, mime_type=mime_type),
+        video_metadata=types.VideoMetadata(
+            start_offset=f"{segment.start_seconds:g}s",
+            end_offset=f"{segment.end_seconds:g}s",
+        ),
+    )
+    segment_prompt = (
+        f"{GEMINI_ANALYSIS_PROMPT} Analyze only the video interval "
+        f"{segment.start_seconds:.3f}s through {segment.end_seconds:.3f}s. "
+        "Use timestamps from the full source video and include only evidence visible "
+        "in this interval."
+    )
+    return [video_part, segment_prompt]
+
+
+def _validate_segment_analysis(
+    analysis: TasteAnalysis,
+    segment: VideoSegment,
+    video_duration_seconds: float,
+) -> TasteAnalysis:
+    validated = TasteAnalysis.model_validate(
+        analysis.model_dump(),
+        context={"video_duration_seconds": video_duration_seconds},
+    )
+    for asset in validated.assets:
+        if asset.start_seconds < segment.start_seconds or asset.end_seconds > segment.end_seconds:
+            raise GeminiAnalysisError(
+                "Gemini segment analysis returned asset evidence outside its requested interval "
+                f"({asset.id}: {asset.start_seconds:.3f}s-{asset.end_seconds:.3f}s, "
+                f"segment {segment.start_seconds:.3f}s-{segment.end_seconds:.3f}s)"
+            )
+    return validated
 
 
 def cleanup_uploaded_files(
@@ -398,9 +446,7 @@ def cleanup_uploaded_files(
 ) -> None:
     """Best-effort cleanup that never overrides the run's primary outcome."""
     file_names = {
-        name
-        for name in (getattr(uploaded_file, "name", None),)
-        if isinstance(name, str) and name
+        name for name in (getattr(uploaded_file, "name", None),) if isinstance(name, str) and name
     }
     try:
         remote_files = call_with_telemetry(
@@ -444,6 +490,7 @@ def analyze_video(
     mock: bool = False,
     mock_payload_path: Path | None = None,
     telemetry: GeminiRunTelemetry | None = None,
+    video_duration_seconds: float | None = None,
 ) -> TasteAnalysis:
     started_at = time.monotonic()
     if mock:
@@ -486,18 +533,51 @@ def analyze_video(
             telemetry=telemetry,
         )
         logger.debug("Gemini file %s is ACTIVE", active_file.name)
-        response = call_with_telemetry(
-            lambda: client.models.generate_content(
-                model=config.gemini_model,
-                contents=[active_file, GEMINI_ANALYSIS_PROMPT],
-                config=build_generation_config(config),
-            ),
-            config,
-            operation_name="generation",
-            telemetry=telemetry,
-            retry_ambiguous_transport_errors=False,
+        segments = build_segment_plan(video_duration_seconds, config)
+        if telemetry is not None:
+            telemetry.analysis_plan = {
+                "segment_count": len(segments),
+                "segments": [
+                    {"start_seconds": segment.start_seconds, "end_seconds": segment.end_seconds}
+                    for segment in segments
+                ],
+                "media_resolution": config.gemini_media_resolution,
+                "max_output_tokens_per_segment": config.gemini_max_output_tokens,
+                "estimated_max_output_tokens": len(segments) * config.gemini_max_output_tokens,
+            }
+        segment_analyses = []
+        for segment in segments:
+            operation_name = (
+                "generation" if len(segments) == 1 else f"generation_segment_{segment.index}"
+            )
+            contents = (
+                [active_file, GEMINI_ANALYSIS_PROMPT]
+                if video_duration_seconds is None
+                else _segment_contents(active_file, segment)
+            )
+            response = call_with_telemetry(
+                lambda contents=contents: client.models.generate_content(
+                    model=config.gemini_model,
+                    contents=contents,
+                    config=build_generation_config(config),
+                ),
+                config,
+                operation_name=operation_name,
+                telemetry=telemetry,
+                retry_ambiguous_transport_errors=False,
+            )
+            _record_response_telemetry(response, telemetry)
+            segment_analysis = parse_gemini_json(response.text or "")
+            if video_duration_seconds is not None:
+                segment_analysis = _validate_segment_analysis(
+                    segment_analysis,
+                    segment,
+                    video_duration_seconds,
+                )
+            segment_analyses.append(segment_analysis)
+        analysis = (
+            merge_segment_analyses(segment_analyses) if len(segments) > 1 else segment_analyses[0]
         )
-        _record_response_telemetry(response, telemetry)
     except GeminiAnalysisError:
         raise
     except Exception as exc:
@@ -520,4 +600,4 @@ def analyze_video(
             )
         if telemetry is not None:
             telemetry.total_duration_seconds = time.monotonic() - started_at
-    return parse_gemini_json(response.text or "")
+    return analysis

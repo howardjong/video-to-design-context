@@ -89,11 +89,13 @@ def test_valid_json_with_invalid_schema_fails_gracefully():
 
 
 def test_generation_config_requests_json_matching_schema():
-    config = build_generation_config()
+    config = build_generation_config(TastepackConfig(gemini_max_output_tokens=4096))
 
     assert config.response_mime_type == "application/json"
     assert config.response_schema is TasteAnalysis
     assert config.http_options.timeout == 300_000
+    assert config.media_resolution.name == "MEDIA_RESOLUTION_HIGH"
+    assert config.max_output_tokens == 4096
 
 
 def test_load_api_key_reads_dotenv_without_printing_secret(tmp_path, monkeypatch, capsys):
@@ -115,6 +117,8 @@ class FakeFile:
         self.name = name
         self.state = state
         self.display_name = display_name
+        self.uri = f"https://generativelanguage.googleapis.com/v1beta/{name}"
+        self.mime_type = "video/mp4"
 
 
 class FakeState:
@@ -478,6 +482,67 @@ def test_analyze_video_applies_separate_operation_timeouts(tmp_path, monkeypatch
     assert fake_client.files.get_configs[0].http_options.timeout == 12_000
     assert fake_client.models.generate_configs[0].http_options.timeout == 13_000
     assert fake_client.files.delete_configs[0].http_options.timeout == 14_000
+
+
+def test_segmented_analysis_uploads_once_and_retries_only_the_failed_segment(tmp_path, monkeypatch):
+    def segment_payload(asset_id, start, end, moment):
+        payload = valid_payload()
+        payload["assets"][0].update(
+            {
+                "id": asset_id,
+                "name": asset_id,
+                "start_timestamp": start,
+                "end_timestamp": end,
+            }
+        )
+        payload["preference_moments"][0].update({"asset_id": asset_id, "timestamp": moment})
+        payload["suggested_frames"][0].update({"asset_id": asset_id, "timestamp": moment})
+        return type("Response", (), {"text": json.dumps(payload)})()
+
+    class SegmentModels:
+        def __init__(self):
+            self.calls = []
+            self.responses = iter(
+                [
+                    segment_payload("asset-one", 0, 30, 12),
+                    FakeApiError(503),
+                    segment_payload("asset-two", 30, 60, 42),
+                ]
+            )
+
+        def generate_content(self, **kwargs):
+            self.calls.append(kwargs)
+            response = next(self.responses)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+    fake_client = FakeGeminiClient()
+    fake_client.models = SegmentModels()
+    monkeypatch.setattr("tastepack.gemini.load_api_key", lambda: "fake-key")
+    monkeypatch.setattr("google.genai.Client", lambda api_key: fake_client)
+
+    analysis = analyze_video(
+        tmp_path / "input.mp4",
+        TastepackConfig(
+            analysis_segment_seconds=30,
+            analysis_segment_overlap_seconds=0,
+            gemini_max_retries=2,
+        ),
+        video_duration_seconds=60,
+    )
+
+    assert [asset.id for asset in analysis.assets] == ["asset-one", "asset-two"]
+    assert len(fake_client.files.upload_configs) == 1
+    assert len(fake_client.models.calls) == 3
+    offsets = [
+        (
+            call["contents"][0].video_metadata.start_offset,
+            call["contents"][0].video_metadata.end_offset,
+        )
+        for call in fake_client.models.calls
+    ]
+    assert offsets == [("0s", "30s"), ("30s", "60s"), ("30s", "60s")]
 
 
 def test_analyze_video_deletes_uploaded_file_after_generation_failure(tmp_path, monkeypatch):

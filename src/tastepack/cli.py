@@ -200,6 +200,7 @@ def process(
                 mock=mock_gemini,
                 mock_payload_path=mock_payload,
                 telemetry=gemini_telemetry,
+                video_duration_seconds=duration,
             ),
         )
         analysis = run_step(
