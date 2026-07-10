@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 import zipfile
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -210,6 +212,8 @@ def generate_artifacts(
     source_video_name: str,
     source_video_metadata: dict | None = None,
     provider_metadata: dict[str, Any] | None = None,
+    source_transcript_path: Path | None = None,
+    coverage_frames: list[ExtractedFrame] | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     taste_packet = build_taste_packet_markdown(
@@ -241,7 +245,15 @@ def generate_artifacts(
             asset_root=output_dir,
         )
 
-    validate_staged_pack(output_dir, analysis, extracted_frames, config)
+    coverage_frames = coverage_frames or []
+    transcript_evidence = None
+    if source_transcript_path is not None:
+        transcript_evidence = copy_source_transcript_evidence(output_dir, source_transcript_path)
+    if config.qa_enabled and (transcript_evidence is None or not coverage_frames):
+        raise ArtifactGenerationError(
+            "QA requires a source transcript and at least one independent coverage frame"
+        )
+    validate_staged_pack(output_dir, analysis, extracted_frames, config, coverage_frames)
     safe_source_metadata = source_video_metadata or {}
     metadata = {
         "run_status": "complete",
@@ -260,12 +272,38 @@ def generate_artifacts(
         "config": config.model_dump(exclude={"request_timeout_seconds"}),
         "delivery_packet": delivery_packet_metadata(),
     }
+    if transcript_evidence is not None:
+        metadata["source_transcript"] = transcript_evidence
+    if coverage_frames:
+        metadata["qa_evidence"] = {
+            "coverage_frames": [frame.to_metadata() for frame in coverage_frames]
+        }
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True),
         encoding="utf-8",
     )
     create_delivery_archive(output_dir)
     validate_complete_metadata(output_dir)
+
+
+def copy_source_transcript_evidence(
+    output_dir: Path,
+    source_transcript_path: Path,
+) -> dict[str, str]:
+    if (
+        source_transcript_path.is_symlink()
+        or not source_transcript_path.is_file()
+        or source_transcript_path.stat().st_size == 0
+    ):
+        raise ArtifactGenerationError("Source transcript must be a non-empty regular file")
+    destination = output_dir / "evidence" / "source_transcript.md"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source_transcript_path, destination)
+    return {
+        "path": destination.relative_to(output_dir).as_posix(),
+        "original_filename": source_transcript_path.name,
+        "sha256": sha256(destination.read_bytes()).hexdigest(),
+    }
 
 
 def delivery_packet_metadata() -> dict[str, str]:
@@ -321,6 +359,7 @@ def validate_staged_pack(
     analysis: TasteAnalysis,
     extracted_frames: list[ExtractedFrame],
     config: TastepackConfig,
+    coverage_frames: list[ExtractedFrame] | None = None,
 ) -> None:
     required_paths = [
         output_dir / "analysis.json",
@@ -343,7 +382,7 @@ def validate_staged_pack(
         raise ArtifactGenerationError(
             "Canonical analysis.json does not match the validated analysis"
         )
-    for frame in extracted_frames:
+    for frame in [*extracted_frames, *(coverage_frames or [])]:
         frame_path = output_dir / frame.relative_path
         if not frame_path.is_file() or frame_path.stat().st_size == 0:
             raise ArtifactGenerationError(
@@ -362,6 +401,42 @@ def validate_complete_metadata(output_dir: Path) -> None:
     expected_delivery_packet = delivery_packet_metadata()
     if metadata.get("delivery_packet") != expected_delivery_packet:
         raise ArtifactGenerationError("metadata.json does not describe the delivery archive")
+    if "qa" in metadata:
+        qa = metadata["qa"]
+        if not isinstance(qa, dict) or qa.get("status") != "complete":
+            raise ArtifactGenerationError("metadata.json does not describe a complete QA audit")
+        required_qa_paths = [
+            "START_HERE.md",
+            "qa/audit.json",
+            "qa/visual_inventory.json",
+            "qa_report.md",
+            "qa/raw/analysis.gemini.json",
+            "qa/raw/design_preferences.gemini.md",
+            "qa/raw/taste_packet.gemini.md",
+        ]
+        for relative_path in required_qa_paths:
+            path = output_dir / relative_path
+            if not path.is_file() or path.stat().st_size == 0:
+                raise ArtifactGenerationError(f"QA artifact is missing or empty: {relative_path}")
+        qa_evidence = qa.get("evidence")
+        if not isinstance(qa_evidence, dict):
+            raise ArtifactGenerationError("metadata.json does not describe QA evidence")
+        if qa_evidence.get("source_transcript") != metadata.get("source_transcript"):
+            raise ArtifactGenerationError(
+                "QA source transcript metadata does not match output metadata"
+            )
+        coverage = qa_evidence.get("coverage_frames")
+        if (
+            not isinstance(coverage, list)
+            or len(coverage) != qa_evidence.get("coverage_frame_count")
+        ):
+            raise ArtifactGenerationError("metadata.json does not describe every QA coverage frame")
+        for item in coverage:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                raise ArtifactGenerationError("QA coverage frame metadata is invalid")
+            path = output_dir / item["path"]
+            if not path.is_file() or item.get("sha256") != sha256(path.read_bytes()).hexdigest():
+                raise ArtifactGenerationError("QA coverage frame fingerprint does not match output")
     _validate_delivery_archive(output_dir)
 
 

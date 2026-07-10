@@ -166,6 +166,30 @@ def build_fallback_frames(
     return select_frames(fallback_candidates, fallback_config, video_duration_seconds)
 
 
+def build_coverage_frames(
+    video_duration_seconds: float,
+    config: TastepackConfig,
+) -> list[SuggestedFrame]:
+    """Return deterministic, model-independent frames for visual QA coverage."""
+    safe_end = round(max(0.0, video_duration_seconds - END_OF_VIDEO_EPSILON_SECONDS), 3)
+    timestamps: list[float] = [0.0]
+    next_timestamp = config.qa_coverage_interval_seconds
+    while next_timestamp < safe_end:
+        timestamps.append(next_timestamp)
+        next_timestamp += config.qa_coverage_interval_seconds
+    if safe_end > 0 and safe_end not in timestamps:
+        timestamps.append(safe_end)
+    return [
+        SuggestedFrame(
+            asset_id="qa-coverage",
+            timestamp=timestamp,
+            reason="Independent QA coverage frame",
+            confidence=1.0,
+        )
+        for timestamp in timestamps
+    ]
+
+
 def frame_filename(frame: SuggestedFrame) -> str:
     millis = int(round(frame.timestamp_seconds * 1000))
     safe_asset_id = "".join(
@@ -219,17 +243,18 @@ def extract_frames(
     skip_ffmpeg: bool = False,
     expected_source_metadata: dict[str, object] | None = None,
     ffmpeg_timeout_seconds: float = 30.0,
+    relative_directory: Path = Path("frames"),
 ) -> list[ExtractedFrame]:
     if expected_source_metadata is not None:
         try:
             assert_source_unchanged(video_path, expected_source_metadata)
         except VideoValidationError as exc:
             raise FrameExtractionError(str(exc)) from exc
-    frames_dir = output_dir / "frames"
+    frames_dir = output_dir / relative_directory
     frames_dir.mkdir(parents=True, exist_ok=True)
     extracted_frames: list[ExtractedFrame] = []
     for frame in frames:
-        relative_path = Path("frames") / frame_filename(frame)
+        relative_path = relative_directory / frame_filename(frame)
         destination = output_dir / relative_path
         if skip_ffmpeg:
             destination.write_text(

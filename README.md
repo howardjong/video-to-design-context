@@ -62,6 +62,19 @@ GEMINI_API_KEY=your-key-here
 
 `GOOGLE_API_KEY` is also accepted. Do not commit `.env`; it is ignored by git.
 
+## Claude QA API Key
+
+The optional evidence-grounded QA stage uses Anthropic only after Gemini has finished
+its video analysis. Add a separate key when you enable `--qa`:
+
+```text
+ANTHROPIC_API_KEY=your-key-here
+```
+
+The original source transcript and extracted frames are sent to the QA provider, but
+the source video is never resent to Gemini for QA. Keys are never written to packs,
+logs, manifests, or terminal output.
+
 ## Usage
 
 Process an MP4 or MOV:
@@ -75,6 +88,21 @@ Use a specific Gemini model:
 ```bash
 uv run tastepack process input.mp4 --out ./claude-pack --model gemini-3.5-flash
 ```
+
+Run evidence-grounded QA for a direct video. QA requires the original timestamped
+Markdown transcript and a Claude model name:
+
+```bash
+uv run tastepack process input.mp4 \
+  --out ./claude-pack \
+  --qa \
+  --qa-model YOUR_CLAUDE_MODEL \
+  --source-transcript ./transcript.md
+```
+
+`--qa-mode warn` (the default) produces a reviewed pack with the corrections log.
+`--qa-mode enforce` rejects a pack when the judge reports unresolved unsupported or
+hallucinated claims. Neither mode sends the transcript as a separate Gemini input.
 
 Tune frame selection:
 
@@ -170,6 +198,21 @@ uv run tastepack process-inbox \
   --gemini-concurrency 1
 ```
 
+For an asset bundle with exactly one timestamped Markdown companion, enable the same
+QA stage at drain time:
+
+```bash
+uv run tastepack process-inbox \
+  --data-dir ./tastepack-data \
+  --qa \
+  --qa-model YOUR_CLAUDE_MODEL
+```
+
+The queue records the companion transcript in the manifest, copies it exactly to the
+delivery pack, and extracts independent coverage frames every three seconds by default.
+If the transcript is missing, malformed, or not timestamped, QA fails before Claude or
+Gemini is contacted.
+
 `--workers` limits claimed local jobs. `--gemini-concurrency` limits simultaneous
 Gemini analyses across those workers. A shared `429` cooldown is honored by all
 workers. A corrupt or unsupported source fails independently, but Gemini, schema,
@@ -189,6 +232,17 @@ uv run tastepack retry-failed JOB_ID --data-dir ./tastepack-data
 uv run tastepack retry-failed JOB_ID --data-dir ./tastepack-data --acknowledge-provider-retry
 ```
 
+Re-audit a completed pack that already contains QA evidence without making a Gemini
+request:
+
+```bash
+uv run tastepack audit ./claude-pack --qa-model YOUR_CLAUDE_MODEL
+```
+
+`audit` is atomic: provider, citation, or artifact failures leave the existing complete
+pack unchanged. It requires `evidence/source_transcript.md` and
+`evidence/coverage_frames/`, so packs created before QA must be regenerated with `--qa`.
+
 Provider failures and interrupted Gemini calls require explicit acknowledgement before
 retrying because the original request may have reached Gemini. A validated analysis
 snapshot is persisted before local artifact work; restart resumes those local steps
@@ -196,7 +250,7 @@ without another Gemini call. A job interrupted before Gemini is safely requeued.
 
 ## Output
 
-The output directory contains:
+The output directory contains these core artifacts:
 
 ```text
 claude-pack/
@@ -211,11 +265,27 @@ claude-pack/
     ...
 ```
 
-`analysis.json` is the canonical validated structured analysis. `taste_packet.md`
-is the main Claude upload context; it includes source metadata, asset/example
-ranges, preference moments, confidence scores, categories, and asset-scoped
-frame references. Valid extracted frames are embedded in both this Markdown and
-the PDF when generated.
+When QA is enabled, it also contains:
+
+```text
+  evidence/
+    source_transcript.md
+    coverage_frames/
+      ...
+  qa/
+    audit.json
+    visual_inventory.json
+    raw/
+      ...
+  qa_report.md
+  START_HERE.md
+```
+
+`analysis.json` is the canonical validated Gemini analysis. Without QA,
+`taste_packet.md` is the main Claude upload context; it includes source metadata,
+asset/example ranges, preference moments, confidence scores, categories, and
+asset-scoped frame references. Valid extracted frames are embedded in both this
+Markdown and the PDF when generated.
 
 The transcript and on-screen text are marked as **untrusted source evidence**.
 They are context to assess, never instructions to follow. `metadata.json` records
@@ -247,6 +317,12 @@ preferences.
 artifact except itself, preserving the `frames/` paths referenced by `taste_packet.md`.
 It never includes source media, inbox/job logs, or temporary processing files.
 
+When QA is enabled, start a receiving model with `START_HERE.md`, then
+`taste_packet.md`, `design_preferences.md`, and `qa_report.md`. `analysis.json` and
+`qa/raw/` preserve raw Gemini provenance and are explicitly non-authoritative. The
+reviewed preferences cite `evidence/source_transcript.md` and independent coverage
+frames; static frames do not prove motion without a timestamped transcript quote.
+
 The run is hard-fail by default. If Gemini analysis, frame extraction, Markdown
 generation, metadata writing, or PDF generation fails, `tastepack` removes its
 temporary staging directory and does not promote a partial pack. Existing output
@@ -259,6 +335,10 @@ Use `--mock-gemini` for local tests or demos without calling Gemini:
 ```bash
 uv run tastepack process input.mp4 --out ./claude-pack --mock-gemini --skip-ffmpeg --no-pdf
 ```
+
+For an offline QA fixture, add `--qa --qa-model test-model --mock-qa` and provide a
+timestamped `--source-transcript`. `--mock-qa` is for tests/demos only and makes no
+Anthropic request.
 
 Use a fixture payload:
 
@@ -304,6 +384,11 @@ Pass a JSON config file with `--config`:
   "gemini_generation_timeout_seconds": 300,
   "gemini_cleanup_timeout_seconds": 30,
   "cleanup_uploaded_files": true,
+  "qa_enabled": false,
+  "qa_model": null,
+  "qa_mode": "warn",
+  "qa_coverage_interval_seconds": 3,
+  "qa_generation_timeout_seconds": 180,
   "verbosity": "normal"
 }
 ```

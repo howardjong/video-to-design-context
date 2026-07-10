@@ -227,6 +227,7 @@ def process_inbox(
     mock_gemini: bool = False,
     mock_payload: Path | None = None,
     skip_ffmpeg: bool = False,
+    mock_qa: bool = False,
     preflight: Callable[..., dict[str, object]] = validate_input_video,
     runner: Callable[..., Any] = run_processing_job,
     sleep: Callable[[float], None] = time.sleep,
@@ -280,6 +281,7 @@ def process_inbox(
                         mock_gemini=mock_gemini,
                         mock_payload=mock_payload,
                         skip_ffmpeg=skip_ffmpeg,
+                        mock_qa=mock_qa,
                         preflight=preflight,
                         runner=runner,
                         circuit_breaker=circuit_breaker,
@@ -402,6 +404,7 @@ def _execute_claimed_job(
     mock_gemini: bool,
     mock_payload: Path | None,
     skip_ffmpeg: bool,
+    mock_qa: bool,
     preflight: Callable[..., dict[str, object]],
     runner: Callable[..., Any],
     circuit_breaker: ProviderCircuitBreaker,
@@ -419,6 +422,7 @@ def _execute_claimed_job(
                 mock_gemini=mock_gemini,
                 mock_payload=mock_payload,
                 skip_ffmpeg=skip_ffmpeg,
+                mock_qa=mock_qa,
                 preflight=preflight,
                 runner=runner,
                 gemini_permit=gemini_gate.permit,
@@ -576,6 +580,7 @@ def _resolve_claimed_video(
 
     video = videos[0]
     audio_companions = [path for path in files if path.suffix.lower() == ".mp3"]
+    transcript_companions = [path for path in files if path.suffix.lower() == ".md"]
     return video, {
         "source_video_name": video.name,
         "source_video_relative_path": video.relative_to(claimed_input).as_posix(),
@@ -591,6 +596,15 @@ def _resolve_claimed_video(
             if len(audio_companions) == 1
             else {}
         ),
+        **(
+            {
+                "companion_transcript_relative_path": transcript_companions[0]
+                .relative_to(claimed_input)
+                .as_posix()
+            }
+            if len(transcript_companions) == 1
+            else {}
+        ),
     }
 
 
@@ -603,6 +617,7 @@ def _process_claimed_job(
     mock_gemini: bool,
     mock_payload: Path | None,
     skip_ffmpeg: bool,
+    mock_qa: bool,
     preflight: Callable[..., dict[str, object]],
     runner: Callable[..., Any],
     gemini_permit: Callable[[], Any],
@@ -654,6 +669,13 @@ def _process_claimed_job(
     run_key_material = f"{source_hash}:{fingerprint}"
     if isinstance(companion_audio_hash, str):
         run_key_material += f":companion-audio:{companion_audio_hash}"
+    source_transcript: Path | None = None
+    if config.qa_enabled:
+        transcript_relative_path = manifest.get("companion_transcript_relative_path")
+        if isinstance(transcript_relative_path, str):
+            source_transcript = _claimed_input_path(paths, manifest) / transcript_relative_path
+            if source_transcript.is_file() and not source_transcript.is_symlink():
+                run_key_material += f":source-transcript:{source_sha256(source_transcript)}"
     run_key = hashlib.sha256(run_key_material.encode()).hexdigest()
     output_name = f"{_safe_stem(_output_stem(manifest))}--{run_key[:12]}"
     if snapshot is not None and manifest.get("run_key") != run_key:
@@ -724,6 +746,8 @@ def _process_claimed_job(
         "precomputed_provider_metadata": (
             snapshot.get("provider_metadata") if snapshot is not None else None
         ),
+        "source_transcript": source_transcript,
+        "mock_qa": mock_qa,
     }
     if analysis_video is not None:
         runner_kwargs["analysis_video"] = analysis_video

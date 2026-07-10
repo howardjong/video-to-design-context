@@ -12,13 +12,18 @@ from uuid import uuid4
 
 from tastepack.artifacts import generate_artifacts
 from tastepack.config import TastepackConfig
-from tastepack.frames import extract_frames, select_frames_for_analysis
+from tastepack.frames import build_coverage_frames, extract_frames, select_frames_for_analysis
 from tastepack.gemini import (
     GeminiRunTelemetry,
     analyze_video,
     build_gemini_provider_metadata,
 )
 from tastepack.logging import get_logger, redact_secrets
+from tastepack.qa import (
+    QualityAuditProvider,
+    audit_staged_pack,
+    validate_source_transcript,
+)
 from tastepack.schema import TasteAnalysis
 from tastepack.video import validate_input_video
 
@@ -146,6 +151,9 @@ def run_processing_job(
     lifecycle_callback: LifecycleCallback | None = None,
     dependencies: PipelineDependencies | None = None,
     analysis_video: Path | None = None,
+    source_transcript: Path | None = None,
+    qa_provider: QualityAuditProvider | None = None,
+    mock_qa: bool = False,
 ) -> PipelineResult:
     dependencies = dependencies or PipelineDependencies(promote_output=promote_output)
     promote = dependencies.promote_output or promote_output
@@ -186,6 +194,13 @@ def run_processing_job(
         duration = video_metadata.get("duration_seconds")
         if not isinstance(duration, int | float) or isinstance(duration, bool):
             duration = None
+        if config.qa_enabled:
+            source_transcript = run_step(
+                "QA preflight",
+                "Provide a non-empty timestamped Markdown transcript before retrying.",
+                lambda: validate_source_transcript(source_transcript),
+                FailureCategory.INPUT,
+            )
 
         gemini_telemetry = GeminiRunTelemetry()
         if precomputed_analysis is None:
@@ -264,6 +279,36 @@ def run_processing_job(
             ),
             FailureCategory.SYSTEM,
         )
+        coverage_frames = []
+        if config.qa_enabled:
+            coverage_duration = duration
+            if coverage_duration is None:
+                coverage_duration = max(
+                    (asset.end_seconds for asset in analysis.assets),
+                    default=0.0,
+                )
+            if coverage_duration <= 0:
+                raise PipelineFailure(
+                    "QA evidence extraction",
+                    "No usable video duration is available for independent coverage frames",
+                    "Fix video preflight metadata before retrying.",
+                    FailureCategory.SYSTEM,
+                )
+            coverage_selection = build_coverage_frames(float(coverage_duration), config)
+            coverage_frames = run_step(
+                "QA evidence extraction",
+                "Check ffmpeg output and the configured QA coverage interval.",
+                lambda: dependencies.extract_frames(
+                    input_video,
+                    coverage_selection,
+                    staging_dir,
+                    skip_ffmpeg=skip_ffmpeg,
+                    expected_source_metadata=video_metadata,
+                    ffmpeg_timeout_seconds=config.frame_extraction_timeout_seconds,
+                    relative_directory=Path("evidence") / "coverage_frames",
+                ),
+                FailureCategory.SYSTEM,
+            )
         run_step(
             "Artifact generation",
             "Inspect output permissions and PDF generation settings; retry with --no-pdf.",
@@ -275,9 +320,23 @@ def run_processing_job(
                 input_video.name,
                 source_video_metadata=video_metadata,
                 provider_metadata=provider_metadata,
+                source_transcript_path=source_transcript if config.qa_enabled else None,
+                coverage_frames=coverage_frames,
             ),
             FailureCategory.SYSTEM,
         )
+        if config.qa_enabled:
+            run_step(
+                "QA audit",
+                "Inspect the QA provider response, citations, and source evidence before retrying.",
+                lambda: audit_staged_pack(
+                    staging_dir,
+                    config,
+                    provider=qa_provider,
+                    mock=mock_qa,
+                ),
+                FailureCategory.PROVIDER,
+            )
         run_step(
             "Output promotion",
             "Check that the output path is writable and is a directory.",

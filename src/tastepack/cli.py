@@ -31,6 +31,7 @@ from tastepack.inbox_queue import (
 )
 from tastepack.logging import configure_logging, get_logger, redact_secrets
 from tastepack.pipeline import PipelineDependencies, PipelineFailure, run_processing_job
+from tastepack.qa import QualityAuditError, audit_existing_pack
 from tastepack.schema import TasteAnalysis
 from tastepack.video import validate_input_video
 
@@ -145,6 +146,15 @@ def process(
         help="Path to mock JSON payload.",
     ),
     skip_ffmpeg: bool = typer.Option(False, "--skip-ffmpeg", help="Write mock frame files."),
+    qa: bool = typer.Option(False, "--qa", help="Run cross-model evidence QA before promotion."),
+    qa_model: str | None = typer.Option(None, "--qa-model", help="Claude model for QA."),
+    qa_mode: str | None = typer.Option(None, "--qa-mode", help="warn or enforce."),
+    source_transcript: Path | None = typer.Option(
+        None,
+        "--source-transcript",
+        help="Original timestamped Markdown transcript required by --qa.",
+    ),
+    mock_qa: bool = typer.Option(False, "--mock-qa", help="Use offline QA output for tests."),
 ) -> None:
     overrides = {
         "gemini_model": gemini_model,
@@ -162,6 +172,9 @@ def process(
         "gemini_retry_base_delay_seconds": gemini_retry_base_delay_seconds,
         "cleanup_uploaded_files": cleanup_uploaded_files,
         "verbosity": verbosity,
+        "qa_enabled": qa or None,
+        "qa_model": qa_model,
+        "qa_mode": qa_mode,
     }
     try:
         configure_logging("normal")
@@ -188,6 +201,12 @@ def process(
             "Check the config file JSON syntax and CLI flag values.",
             lambda: TastepackConfig.from_sources(config_file, overrides),
         )
+        if mock_qa and not config.qa_enabled:
+            raise PipelineStepError(
+                "Configuration",
+                "--mock-qa requires QA to be enabled",
+                "Add --qa or set qa_enabled in the configuration file.",
+            )
         configure_logging(config.verbosity, log_file)
         logger.debug("Loaded configuration: %s", config.model_dump())
         run_processing_job(
@@ -197,6 +216,8 @@ def process(
             mock_gemini=mock_gemini,
             mock_payload=mock_payload,
             skip_ffmpeg=skip_ffmpeg,
+            source_transcript=source_transcript,
+            mock_qa=mock_qa,
             dependencies=PipelineDependencies(
                 validate_input_video=validate_input_video,
                 analyze_video=analyze_video,
@@ -280,6 +301,10 @@ def process_inbox_command(
         help="Path to mock JSON payload.",
     ),
     skip_ffmpeg: bool = typer.Option(False, "--skip-ffmpeg", help="Write mock frame files."),
+    qa: bool = typer.Option(False, "--qa", help="Run cross-model evidence QA before promotion."),
+    qa_model: str | None = typer.Option(None, "--qa-model", help="Claude model for QA."),
+    qa_mode: str | None = typer.Option(None, "--qa-mode", help="warn or enforce."),
+    mock_qa: bool = typer.Option(False, "--mock-qa", help="Use offline QA output for tests."),
 ) -> None:
     paths = IntakePaths.from_root(data_dir)
     paths.ensure()
@@ -299,6 +324,9 @@ def process_inbox_command(
         "gemini_retry_base_delay_seconds": gemini_retry_base_delay_seconds,
         "cleanup_uploaded_files": cleanup_uploaded_files,
         "verbosity": verbosity,
+        "qa_enabled": qa or None,
+        "qa_model": qa_model,
+        "qa_mode": qa_mode,
     }
     effective_log_file = log_file or paths.logs / (
         "inbox-" + datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + ".log"
@@ -323,6 +351,12 @@ def process_inbox_command(
                 "Add --mock-gemini to use a local analysis fixture.",
             )
         config = TastepackConfig.from_sources(config_file, overrides)
+        if mock_qa and not config.qa_enabled:
+            raise PipelineStepError(
+                "Configuration",
+                "--mock-qa requires QA to be enabled",
+                "Add --qa or set qa_enabled in the configuration file.",
+            )
         configure_logging(config.verbosity, effective_log_file)
         inbox_options = {
             "stable_seconds": stable_seconds,
@@ -333,6 +367,7 @@ def process_inbox_command(
             "mock_gemini": mock_gemini,
             "mock_payload": mock_payload,
             "skip_ffmpeg": skip_ffmpeg,
+            "mock_qa": mock_qa,
         }
         if watch:
             try:
@@ -413,6 +448,37 @@ def retry_failed_command(
             "Next: Review the job manifest and retry with the required acknowledgement."
         ) from exc
     typer.echo(f"Queued {manifest['source_name']} for retry from job {manifest['job_id']}.")
+
+
+@app.command("audit")
+def audit_command(
+    output_dir: Path = typer.Argument(
+        ...,
+        exists=False,
+        help="Completed tastepack output directory.",
+    ),
+    config_file: Path | None = typer.Option(None, "--config", help="Optional JSON config file."),
+    qa_model: str | None = typer.Option(None, "--qa-model", help="Claude model for QA."),
+    qa_mode: str | None = typer.Option(None, "--qa-mode", help="warn or enforce."),
+    mock_qa: bool = typer.Option(False, "--mock-qa", help="Use offline QA output for tests."),
+) -> None:
+    try:
+        config = TastepackConfig.from_sources(
+            config_file,
+            {
+                "qa_enabled": True,
+                "qa_model": qa_model,
+                "qa_mode": qa_mode,
+            },
+        )
+        run_step(
+            "QA audit",
+            "Inspect QA source evidence, provider availability, and citations before retrying.",
+            lambda: audit_existing_pack(output_dir, config, mock=mock_qa),
+        )
+    except (PipelineStepError, QualityAuditError, ValueError, RuntimeError) as exc:
+        raise typer.BadParameter(redact_secrets(exc)) from exc
+    typer.echo(f"QA-reviewed tastepack output at {output_dir}")
 
 
 def promote_output(staging_dir: Path, out: Path) -> None:

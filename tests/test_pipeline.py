@@ -12,6 +12,7 @@ from tastepack.pipeline import (
     PipelineFailure,
     run_processing_job,
 )
+from tastepack.qa import MockQualityAuditProvider, QualityAuditError
 from tastepack.schema import TasteAnalysis
 
 
@@ -128,3 +129,127 @@ def test_pipeline_emits_validated_analysis_before_artifact_work(tmp_path: Path) 
     assert states.index("analysis_validated") < states.index("output_promoted")
     snapshot = next(payload for state, payload in events if state == "analysis_validated")
     assert snapshot["analysis"] == analysis.model_dump(mode="json")
+
+
+def test_qa_preflight_requires_source_transcript_before_gemini(tmp_path: Path) -> None:
+    input_video = tmp_path / "input.mp4"
+    input_video.write_bytes(b"fake-video")
+    analyzed = False
+
+    def fail_if_analyzed(*_args, **_kwargs):
+        nonlocal analyzed
+        analyzed = True
+        raise AssertionError("Gemini must not be called")
+
+    dependencies = PipelineDependencies(
+        validate_input_video=lambda *_args, **_kwargs: {
+            "duration_seconds": 20.0,
+            "source_sha256": "abc",
+        },
+        analyze_video=fail_if_analyzed,
+    )
+
+    with pytest.raises(PipelineFailure, match="source transcript") as raised:
+        run_processing_job(
+            input_video,
+            tmp_path / "pack",
+            TastepackConfig(produce_pdf=False, qa_enabled=True, qa_model="test-claude"),
+            mock_gemini=True,
+            skip_ffmpeg=True,
+            dependencies=dependencies,
+        )
+
+    assert raised.value.category is FailureCategory.INPUT
+    assert analyzed is False
+
+
+def test_qa_preflight_rejects_untimestamped_transcript_before_gemini(tmp_path: Path) -> None:
+    input_video = tmp_path / "input.mp4"
+    input_video.write_bytes(b"fake-video")
+    source_transcript = tmp_path / "source-transcript.md"
+    source_transcript.write_text("No timestamp here.\n", encoding="utf-8")
+    analyzed = False
+
+    def fail_if_analyzed(*_args, **_kwargs):
+        nonlocal analyzed
+        analyzed = True
+        raise AssertionError("Gemini must not be called")
+
+    dependencies = PipelineDependencies(
+        validate_input_video=lambda *_args, **_kwargs: {
+            "duration_seconds": 20.0,
+            "source_sha256": "abc",
+        },
+        analyze_video=fail_if_analyzed,
+    )
+
+    with pytest.raises(PipelineFailure, match="timestamped"):
+        run_processing_job(
+            input_video,
+            tmp_path / "pack",
+            TastepackConfig(produce_pdf=False, qa_enabled=True, qa_model="test-claude"),
+            mock_gemini=True,
+            skip_ffmpeg=True,
+            source_transcript=source_transcript,
+            dependencies=dependencies,
+        )
+
+    assert analyzed is False
+
+
+def test_pipeline_creates_evidence_and_reviewed_pack_with_mocked_qa(tmp_path: Path) -> None:
+    input_video = tmp_path / "input.mp4"
+    input_video.write_bytes(b"fake-video")
+    source_transcript = tmp_path / "source-transcript.md"
+    source_transcript.write_text("[00:00.000] I like the large heading.\n", encoding="utf-8")
+
+    result = run_processing_job(
+        input_video,
+        tmp_path / "pack",
+        TastepackConfig(
+            produce_pdf=False,
+            qa_enabled=True,
+            qa_model="test-claude",
+            qa_coverage_interval_seconds=3,
+        ),
+        mock_gemini=True,
+        skip_ffmpeg=True,
+        source_transcript=source_transcript,
+        qa_provider=MockQualityAuditProvider(),
+    )
+
+    assert (result.output_dir / "evidence" / "source_transcript.md").read_text() == (
+        "[00:00.000] I like the large heading.\n"
+    )
+    assert list((result.output_dir / "evidence" / "coverage_frames").glob("*.jpg"))
+    assert (result.output_dir / "qa" / "audit.json").is_file()
+    assert (result.output_dir / "START_HERE.md").is_file()
+
+
+def test_qa_provider_failure_never_replaces_existing_complete_pack(tmp_path: Path) -> None:
+    input_video = tmp_path / "input.mp4"
+    input_video.write_bytes(b"fake-video")
+    source_transcript = tmp_path / "source-transcript.md"
+    source_transcript.write_text("[00:00.000] I like the large heading.\n", encoding="utf-8")
+    output_dir = tmp_path / "pack"
+    output_dir.mkdir()
+    (output_dir / "keep.txt").write_text("existing complete pack", encoding="utf-8")
+
+    class ProviderFailure(MockQualityAuditProvider):
+        def inventory(self, request):
+            raise QualityAuditError("QA provider unavailable")
+
+    with pytest.raises(PipelineFailure, match="QA provider unavailable") as raised:
+        run_processing_job(
+            input_video,
+            output_dir,
+            TastepackConfig(produce_pdf=False, qa_enabled=True, qa_model="test-claude"),
+            mock_gemini=True,
+            skip_ffmpeg=True,
+            source_transcript=source_transcript,
+            qa_provider=ProviderFailure(),
+        )
+
+    assert raised.value.category is FailureCategory.PROVIDER
+    assert (output_dir / "keep.txt").read_text() == "existing complete pack"
+    assert not (output_dir / "qa").exists()

@@ -119,6 +119,90 @@ def test_cli_processes_asset_bundle_in_mock_mode(tmp_path):
     ]
 
 
+def test_cli_processes_asset_bundle_with_mocked_qa(tmp_path):
+    data_dir = tmp_path / "tastepack-data"
+    bundle = data_dir / "inbox" / "qa-bundle"
+    bundle.mkdir(parents=True)
+    (bundle / "walkthrough.mp4").write_bytes(b"fake video for mocked mode")
+    (bundle / "transcript.md").write_text(
+        "[00:00.000] I like the large heading.\n", encoding="utf-8"
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "process-inbox",
+            "--data-dir",
+            str(data_dir),
+            "--mock-gemini",
+            "--mock-qa",
+            "--qa",
+            "--qa-model",
+            "test-claude",
+            "--skip-ffmpeg",
+            "--no-pdf",
+            "--stable-seconds",
+            "0",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    output = next((data_dir / "output").glob("qa-bundle--*"))
+    metadata = json.loads((output / "metadata.json").read_text())
+    assert metadata["qa"]["status"] == "complete"
+    assert (output / "evidence" / "source_transcript.md").is_file()
+    assert (output / "qa" / "audit.json").is_file()
+    assert (output / "taste_packet.zip").is_file()
+    manifest = next((data_dir / "jobs").glob("*.json"))
+    assert json.loads(manifest.read_text())["companion_transcript_relative_path"] == "transcript.md"
+
+
+def test_cli_audit_rejects_missing_qa_model_without_calling_provider(tmp_path):
+    result = runner.invoke(app, ["audit", str(tmp_path / "pack")])
+
+    assert result.exit_code != 0
+    assert "qa_model is required" in result.output
+
+
+def test_cli_audit_reaudits_a_completed_qa_pack_without_gemini(tmp_path, monkeypatch):
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"fake video for mocked mode")
+    source_transcript = tmp_path / "source-transcript.md"
+    source_transcript.write_text("[00:00.000] I like the heading.\n", encoding="utf-8")
+    output_dir = tmp_path / "pack"
+    initial = runner.invoke(
+        app,
+        [
+            "process",
+            str(video),
+            "--out",
+            str(output_dir),
+            "--mock-gemini",
+            "--mock-qa",
+            "--qa",
+            "--qa-model",
+            "test-claude",
+            "--source-transcript",
+            str(source_transcript),
+            "--skip-ffmpeg",
+            "--no-pdf",
+        ],
+    )
+    assert initial.exit_code == 0, initial.output
+    monkeypatch.setattr(
+        "tastepack.gemini.analyze_video",
+        lambda *_args, **_kwargs: pytest.fail("audit must not call Gemini"),
+    )
+
+    result = runner.invoke(
+        app,
+        ["audit", str(output_dir), "--qa-model", "test-claude", "--mock-qa"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "QA-reviewed tastepack output" in result.output
+
+
 def test_cli_queue_status_reports_pending_inputs_and_job_states(tmp_path):
     data_dir = tmp_path / "tastepack-data"
     (data_dir / "inbox").mkdir(parents=True)

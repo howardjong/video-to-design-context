@@ -26,6 +26,11 @@ def test_readme_documents_install_usage_config_mocking_and_troubleshooting():
         "retry-failed",
         "--gemini-concurrency",
         "--watch",
+        "ANTHROPIC_API_KEY",
+        "--qa-model",
+        "--source-transcript",
+        "tastepack audit",
+        "START_HERE.md",
     ]
     for phrase in required_phrases:
         assert phrase in readme

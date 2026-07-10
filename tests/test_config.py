@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from tastepack.config import TastepackConfig
 
 
@@ -53,3 +55,13 @@ def test_config_values_can_be_loaded_from_file_and_cli_overrides(tmp_path):
     assert config.max_frames_per_asset == 2
     assert config.produce_pdf is False
     assert config.verbosity == "debug"
+
+
+def test_qa_requires_a_configured_model_when_enabled():
+    with pytest.raises(ValueError, match="qa_model"):
+        TastepackConfig(qa_enabled=True)
+
+    config = TastepackConfig(qa_enabled=True, qa_model="claude-for-qa")
+
+    assert config.qa_mode == "warn"
+    assert config.qa_coverage_interval_seconds == 3

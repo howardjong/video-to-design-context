@@ -36,6 +36,11 @@ class TastepackConfig(BaseModel):
     gemini_generation_timeout_seconds: float = Field(default=300.0, gt=0)
     gemini_cleanup_timeout_seconds: float = Field(default=30.0, gt=0)
     cleanup_uploaded_files: bool = True
+    qa_enabled: bool = False
+    qa_model: str | None = None
+    qa_mode: Literal["warn", "enforce"] = "warn"
+    qa_coverage_interval_seconds: float = Field(default=3.0, gt=0)
+    qa_generation_timeout_seconds: float = Field(default=180.0, gt=0)
 
     @model_validator(mode="before")
     @classmethod
@@ -49,6 +54,12 @@ class TastepackConfig(BaseModel):
             values = dict(values)
             values["gemini_file_processing_timeout_seconds"] = values["request_timeout_seconds"]
         return values
+
+    @model_validator(mode="after")
+    def require_qa_model(self) -> TastepackConfig:
+        if self.qa_enabled and not self.qa_model:
+            raise ValueError("qa_model is required when qa_enabled is true")
+        return self
 
     @classmethod
     def from_sources(
