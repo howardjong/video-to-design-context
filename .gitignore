@@ -5,6 +5,14 @@
 __pycache__/
 *.pyc
 claude-pack/
+/tastepack-data/inbox/*
+!/tastepack-data/inbox/.gitkeep
+/tastepack-data/output/*
+!/tastepack-data/output/.gitkeep
+/tastepack-data/failed/*
+!/tastepack-data/failed/.gitkeep
+/tastepack-data/logs/*
+!/tastepack-data/logs/.gitkeep
 dist/
 build/
 *.egg-info/
