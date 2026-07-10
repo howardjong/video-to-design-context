@@ -8,9 +8,6 @@ It uses Gemini video understanding for structured analysis and `ffmpeg` for
 frame extraction. Secrets stay in environment variables and are not written to
 generated artifacts.
 
-For the current operational state, completed work, troubleshooting workflow, and
-agent handoff protocol, see [HANDOFF.md](HANDOFF.md).
-
 ## Install
 
 From the repo:
