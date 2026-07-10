@@ -25,6 +25,13 @@ class AssetExample(BaseModel):
     start_seconds: float = Field(default=0.0)
     end_seconds: float = Field(default=0.0)
 
+    @field_validator("id")
+    @classmethod
+    def reject_blank_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Asset ID cannot be blank")
+        return value
+
     @model_validator(mode="after")
     def normalize_range(self) -> AssetExample:
         try:
@@ -32,7 +39,7 @@ class AssetExample(BaseModel):
             self.end_seconds = normalize_timestamp(self.end_timestamp)
         except TimestampError as exc:
             raise ValueError(str(exc)) from exc
-        if self.end_seconds < self.start_seconds:
+        if self.end_seconds <= self.start_seconds:
             raise ValueError("Asset end timestamp must be after start timestamp")
         return self
 
@@ -108,12 +115,32 @@ class TasteAnalysis(BaseModel):
     motion_details: MotionDetails
 
     @model_validator(mode="after")
-    def ensure_asset_references_exist(self) -> TasteAnalysis:
-        asset_ids = {asset.id for asset in self.assets}
+    def ensure_asset_references_exist(self, info: ValidationInfo) -> TasteAnalysis:
+        if not self.assets:
+            raise ValueError("Analysis must identify at least one asset")
+        if not self.preference_moments:
+            raise ValueError("Analysis must identify at least one preference moment")
+        assets_by_id = {asset.id: asset for asset in self.assets}
+        if len(assets_by_id) != len(self.assets):
+            raise ValueError("Asset IDs must be unique")
+        context = info.context or {}
+        video_duration_seconds = context.get("video_duration_seconds")
+        if context.get("require_transcript") and not self.transcript.strip():
+            raise ValueError("Analysis transcript is required for narrated video")
+        if video_duration_seconds is not None:
+            for asset in self.assets:
+                if asset.end_seconds > video_duration_seconds:
+                    raise ValueError("Asset range is outside video duration")
         for moment in self.preference_moments:
-            if moment.asset_id not in asset_ids:
+            asset = assets_by_id.get(moment.asset_id)
+            if asset is None:
                 raise ValueError(f"Preference references unknown asset: {moment.asset_id}")
+            if not asset.start_seconds <= moment.timestamp_seconds <= asset.end_seconds:
+                raise ValueError("Preference timestamp is outside asset range")
         for frame in self.suggested_frames:
-            if frame.asset_id not in asset_ids:
+            asset = assets_by_id.get(frame.asset_id)
+            if asset is None:
                 raise ValueError(f"Frame references unknown asset: {frame.asset_id}")
+            if not asset.start_seconds <= frame.timestamp_seconds <= asset.end_seconds:
+                raise ValueError("Frame timestamp is outside asset range")
         return self

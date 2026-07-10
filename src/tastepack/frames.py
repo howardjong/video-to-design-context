@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import subprocess
+from dataclasses import asdict, dataclass
+from hashlib import sha256
 from pathlib import Path
+
+from PIL import Image, UnidentifiedImageError
 
 from tastepack.config import TastepackConfig
 from tastepack.logging import get_logger
@@ -13,6 +17,20 @@ class FrameExtractionError(RuntimeError):
 
 
 logger = get_logger("frames")
+END_OF_VIDEO_EPSILON_SECONDS = 0.1
+
+
+@dataclass(frozen=True)
+class ExtractedFrame:
+    id: str
+    asset_id: str
+    timestamp_seconds: float
+    relative_path: str
+    reason: str
+    confidence: float
+
+    def to_metadata(self) -> dict[str, object]:
+        return asdict(self)
 
 
 def select_frames(
@@ -20,25 +38,51 @@ def select_frames(
     config: TastepackConfig,
     video_duration_seconds: float | None = None,
 ) -> list[SuggestedFrame]:
-    by_key: dict[tuple[str, float], SuggestedFrame] = {}
-    asset_counts: dict[str, int] = {}
+    candidates_by_asset: dict[str, list[SuggestedFrame]] = {}
+    seen_keys: set[tuple[str, float]] = set()
     for frame in sorted(frames, key=lambda item: item.confidence, reverse=True):
         if frame.confidence < config.frame_confidence_threshold:
             continue
         seconds = frame.timestamp_seconds
         if video_duration_seconds is not None:
-            seconds = min(seconds, video_duration_seconds)
+            safe_end = max(0.0, video_duration_seconds - END_OF_VIDEO_EPSILON_SECONDS)
+            seconds = min(seconds, safe_end)
         key = (frame.asset_id, round(seconds, 3))
-        if key in by_key:
+        if key in seen_keys:
             continue
-        if asset_counts.get(frame.asset_id, 0) >= config.max_frames_per_asset:
+        candidates = candidates_by_asset.setdefault(frame.asset_id, [])
+        if len(candidates) >= config.max_frames_per_asset:
             continue
         frame.timestamp_seconds = seconds
-        by_key[key] = frame
-        asset_counts[frame.asset_id] = asset_counts.get(frame.asset_id, 0) + 1
-        if len(by_key) >= config.max_total_frames:
+        candidates.append(frame)
+        seen_keys.add(key)
+
+    selected: list[SuggestedFrame] = []
+    selected_keys: set[tuple[str, float]] = set()
+    first_candidates = sorted(
+        (candidates[0] for candidates in candidates_by_asset.values()),
+        key=lambda item: item.confidence,
+        reverse=True,
+    )
+    for frame in first_candidates:
+        if len(selected) >= config.max_total_frames:
             break
-    return sorted(by_key.values(), key=lambda item: (item.asset_id, item.timestamp_seconds))
+        selected.append(frame)
+        selected_keys.add((frame.asset_id, round(frame.timestamp_seconds, 3)))
+
+    remaining = sorted(
+        (frame for candidates in candidates_by_asset.values() for frame in candidates),
+        key=lambda item: item.confidence,
+        reverse=True,
+    )
+    for frame in remaining:
+        if len(selected) >= config.max_total_frames:
+            break
+        key = (frame.asset_id, round(frame.timestamp_seconds, 3))
+        if key not in selected_keys:
+            selected.append(frame)
+            selected_keys.add(key)
+    return sorted(selected, key=lambda item: (item.asset_id, item.timestamp_seconds))
 
 
 def select_frames_for_analysis(
@@ -52,38 +96,73 @@ def select_frames_for_analysis(
     for frame in selected:
         asset = asset_ranges.get(frame.asset_id)
         if asset:
+            max_seconds = asset.end_seconds
+            if video_duration_seconds is not None:
+                max_seconds = min(
+                    max_seconds,
+                    max(0.0, video_duration_seconds - END_OF_VIDEO_EPSILON_SECONDS),
+                )
+            if asset.start_seconds > max_seconds:
+                continue
             frame.timestamp_seconds = min(
                 max(frame.timestamp_seconds, asset.start_seconds),
-                asset.end_seconds,
+                max_seconds,
             )
         key = (frame.asset_id, round(frame.timestamp_seconds, 3))
         current = by_key.get(key)
         if current is None or frame.confidence > current.confidence:
             by_key[key] = frame
+    remaining_capacity = config.max_total_frames - len(by_key)
+    if remaining_capacity > 0:
+        fallback_frames = build_fallback_frames(
+            analysis.assets,
+            config,
+            covered_asset_ids={frame.asset_id for frame in by_key.values()},
+            max_total_frames=remaining_capacity,
+            video_duration_seconds=video_duration_seconds,
+        )
+        for frame in fallback_frames:
+            by_key.setdefault((frame.asset_id, round(frame.timestamp_seconds, 3)), frame)
     return sorted(by_key.values(), key=lambda item: (item.asset_id, item.timestamp_seconds))
 
 
 def build_fallback_frames(
     assets: list[AssetExample],
     config: TastepackConfig,
+    *,
+    covered_asset_ids: set[str] | None = None,
+    max_total_frames: int | None = None,
+    video_duration_seconds: float | None = None,
 ) -> list[SuggestedFrame]:
-    frames: list[SuggestedFrame] = []
+    fallback_candidates: list[SuggestedFrame] = []
+    covered_asset_ids = covered_asset_ids or set()
     for asset in assets:
+        if asset.id in covered_asset_ids:
+            continue
+        end_seconds = asset.end_seconds
+        if video_duration_seconds is not None:
+            end_seconds = min(
+                end_seconds,
+                max(0.0, video_duration_seconds - END_OF_VIDEO_EPSILON_SECONDS),
+            )
+        if asset.start_seconds > end_seconds:
+            continue
         seconds = asset.start_seconds
         asset_count = 0
-        while seconds <= asset.end_seconds and asset_count < config.max_frames_per_asset:
+        while seconds <= end_seconds and asset_count < config.max_frames_per_asset:
             frame = SuggestedFrame(
                 asset_id=asset.id,
                 timestamp=seconds,
                 reason="Fallback interval frame",
                 confidence=config.frame_confidence_threshold,
             )
-            frames.append(frame)
-            if len(frames) >= config.max_total_frames:
-                return frames
+            fallback_candidates.append(frame)
             seconds += config.fallback_interval_seconds
             asset_count += 1
-    return frames
+    fallback_config = config.model_copy(
+        update={"max_total_frames": max_total_frames or config.max_total_frames}
+    )
+    return select_frames(fallback_candidates, fallback_config, video_duration_seconds)
 
 
 def frame_filename(frame: SuggestedFrame) -> str:
@@ -91,7 +170,13 @@ def frame_filename(frame: SuggestedFrame) -> str:
     safe_asset_id = "".join(
         char if char.isalnum() or char in "-_" else "-" for char in frame.asset_id
     )
-    return f"{safe_asset_id}_{millis:09d}.jpg"
+    asset_digest = sha256(frame.asset_id.encode("utf-8")).hexdigest()[:10]
+    return f"{safe_asset_id or 'asset'}-{asset_digest}_{millis:09d}.jpg"
+
+
+def frame_id(frame: SuggestedFrame) -> str:
+    payload = f"{frame.asset_id}\0{frame.timestamp_seconds:.3f}".encode()
+    return f"frame-{sha256(payload).hexdigest()[:16]}"
 
 
 def build_ffmpeg_extract_command(
@@ -106,6 +191,8 @@ def build_ffmpeg_extract_command(
         f"{timestamp_seconds:.3f}",
         "-i",
         str(video_path),
+        "-vf",
+        "format=yuvj420p",
         "-frames:v",
         "1",
         "-q:v",
@@ -114,15 +201,25 @@ def build_ffmpeg_extract_command(
     ]
 
 
+def validate_extracted_jpeg(destination: Path, relative_path: Path) -> None:
+    try:
+        with Image.open(destination) as image:
+            if image.format != "JPEG":
+                raise FrameExtractionError(f"Extracted frame is not a JPEG: {relative_path}")
+            image.verify()
+    except (UnidentifiedImageError, OSError) as exc:
+        raise FrameExtractionError(f"Extracted frame is an invalid JPEG: {relative_path}") from exc
+
+
 def extract_frames(
     video_path: Path,
     frames: list[SuggestedFrame],
     output_dir: Path,
     skip_ffmpeg: bool = False,
-) -> dict[float, str]:
+) -> list[ExtractedFrame]:
     frames_dir = output_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
-    frame_map: dict[float, str] = {}
+    extracted_frames: list[ExtractedFrame] = []
     for frame in frames:
         relative_path = Path("frames") / frame_filename(frame)
         destination = output_dir / relative_path
@@ -151,5 +248,15 @@ def extract_frames(
                     f"Extracted frame is empty after ffmpeg success at "
                     f"{frame.timestamp_seconds:.3f}s: {relative_path}"
                 )
-        frame_map[round(frame.timestamp_seconds, 3)] = str(relative_path)
-    return frame_map
+            validate_extracted_jpeg(destination, relative_path)
+        extracted_frames.append(
+            ExtractedFrame(
+                id=frame_id(frame),
+                asset_id=frame.asset_id,
+                timestamp_seconds=frame.timestamp_seconds,
+                relative_path=str(relative_path),
+                reason=frame.reason,
+                confidence=frame.confidence,
+            )
+        )
+    return extracted_frames

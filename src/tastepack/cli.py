@@ -9,9 +9,10 @@ import typer
 
 from tastepack.artifacts import generate_artifacts
 from tastepack.config import TastepackConfig
-from tastepack.frames import build_fallback_frames, extract_frames, select_frames_for_analysis
+from tastepack.frames import extract_frames, select_frames_for_analysis
 from tastepack.gemini import GeminiAnalysisError, analyze_video
 from tastepack.logging import configure_logging, get_logger, redact_secrets
+from tastepack.schema import TasteAnalysis
 from tastepack.video import VideoValidationError, probe_duration_seconds, validate_input_video
 
 app = typer.Typer(help="Create Claude-ready design taste context packs from narrated videos.")
@@ -52,6 +53,20 @@ def validate_output_paths(out: Path, log_file: Path | None) -> None:
         shutil.rmtree(probe_dir)
     except OSError as exc:
         raise ValueError(f"Output parent is not writable: {out.parent}: {exc}") from exc
+
+
+def validate_analysis_for_video(
+    analysis: TasteAnalysis,
+    video_metadata: dict[str, object],
+    config: TastepackConfig,
+) -> TasteAnalysis:
+    return TasteAnalysis.model_validate(
+        analysis.model_dump(),
+        context={
+            "video_duration_seconds": video_metadata.get("duration_seconds"),
+            "require_transcript": not config.allow_no_audio,
+        },
+    )
 
 
 @app.callback()
@@ -182,6 +197,12 @@ def process(
                 mock_payload_path=mock_payload,
             ),
         )
+        analysis = run_step(
+            "Analysis validation",
+            "Record a shorter, clearer video or correct the Gemini analysis response "
+            "before retrying.",
+            lambda: validate_analysis_for_video(analysis, video_metadata, config),
+        )
         selected_frames = run_step(
             "Frame selection",
             "Check Gemini suggested frames, confidence thresholds, and fallback interval.",
@@ -191,12 +212,6 @@ def process(
                 video_duration_seconds=duration,
             ),
         )
-        if not selected_frames:
-            selected_frames = run_step(
-                "Fallback frame selection",
-                "Lower frame confidence threshold or adjust fallback interval.",
-                lambda: build_fallback_frames(analysis.assets, config),
-            )
         if not selected_frames:
             raise PipelineStepError(
                 "Frame selection",
@@ -208,7 +223,7 @@ def process(
             tempfile.mkdtemp(prefix=f".{out.name}.tmp-", dir=str(out.parent))
         )
         logger.debug("Created staging directory: %s", staging_dir)
-        frame_map = run_step(
+        extracted_frames = run_step(
             "Frame extraction",
             "Check ffmpeg output and frame timestamps; rerun with --verbosity debug.",
             lambda: extract_frames(
@@ -224,7 +239,7 @@ def process(
             lambda: generate_artifacts(
                 staging_dir,
                 analysis,
-                frame_map,
+                extracted_frames,
                 config,
                 input_video.name,
                 source_video_metadata=video_metadata,

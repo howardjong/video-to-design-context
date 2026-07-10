@@ -2,6 +2,7 @@ import json
 
 from tastepack.artifacts import generate_artifacts
 from tastepack.config import TastepackConfig
+from tastepack.frames import ExtractedFrame
 from tastepack.schema import TasteAnalysis
 
 
@@ -58,12 +59,21 @@ def valid_payload():
 
 def test_markdown_artifacts_include_traceability_and_grouped_assets(tmp_path):
     analysis = TasteAnalysis.model_validate(valid_payload())
-    frame_map = {12.5: "frames/asset-1_000012500.jpg"}
+    extracted_frames = [
+        ExtractedFrame(
+            id="frame-1",
+            asset_id="asset-1",
+            timestamp_seconds=12.5,
+            relative_path="frames/asset-1_000012500.jpg",
+            reason="Shows the KPI/table relationship.",
+            confidence=0.91,
+        )
+    ]
 
     generate_artifacts(
         output_dir=tmp_path,
         analysis=analysis,
-        frame_map=frame_map,
+        extracted_frames=extracted_frames,
         config=TastepackConfig(produce_pdf=False),
         source_video_name="input.mp4",
     )
@@ -93,7 +103,7 @@ def test_api_keys_are_never_written_to_artifacts(tmp_path, monkeypatch):
     generate_artifacts(
         output_dir=tmp_path,
         analysis=analysis,
-        frame_map={},
+        extracted_frames=[],
         config=TastepackConfig(produce_pdf=False),
         source_video_name="input.mp4",
     )
@@ -131,7 +141,7 @@ def test_multiple_assets_produce_separate_grouped_sections(tmp_path):
     generate_artifacts(
         output_dir=tmp_path,
         analysis=analysis,
-        frame_map={},
+        extracted_frames=[],
         config=TastepackConfig(produce_pdf=False),
         source_video_name="input.mp4",
     )

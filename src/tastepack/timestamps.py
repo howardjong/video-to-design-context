@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -12,6 +13,8 @@ def normalize_timestamp(raw: Any) -> float:
         raise TimestampError("Boolean values are not valid timestamps")
     if isinstance(raw, int | float):
         seconds = float(raw)
+        if not math.isfinite(seconds):
+            raise TimestampError("Timestamp must be finite")
         if seconds < 0:
             raise TimestampError("Timestamp cannot be negative")
         return seconds
@@ -37,6 +40,8 @@ def normalize_timestamp(raw: Any) -> float:
     except ValueError as exc:
         raise TimestampError(f"Invalid timestamp: {raw}") from exc
 
+    if not all(math.isfinite(part) for part in numeric):
+        raise TimestampError("Timestamp must be finite")
     if any(part < 0 for part in numeric):
         raise TimestampError("Timestamp cannot be negative")
     if len(numeric) == 2:

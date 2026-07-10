@@ -4,6 +4,8 @@ import pytest
 from typer.testing import CliRunner
 
 from tastepack.cli import app, promote_output
+from tastepack.gemini import MOCK_ANALYSIS
+from tastepack.schema import TasteAnalysis
 
 runner = CliRunner()
 
@@ -214,6 +216,44 @@ def test_unusable_output_parent_fails_before_gemini_analysis(tmp_path, monkeypat
     assert result.exit_code != 0
     assert "Output preflight" in result.output
     assert analysis_called is False
+
+
+def test_out_of_video_gemini_analysis_fails_before_frame_extraction(tmp_path, monkeypatch):
+    video = tmp_path / "input.mp4"
+    video.write_bytes(b"fake video")
+    metadata = {
+        "duration_seconds": 10.0,
+        "width": 1280,
+        "height": 720,
+        "video_stream_count": 1,
+        "audio_stream_count": 1,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "file_size_bytes": video.stat().st_size,
+    }
+    monkeypatch.setattr("tastepack.cli.validate_input_video", lambda *args, **kwargs: metadata)
+    monkeypatch.setattr("tastepack.cli.probe_duration_seconds", lambda *args, **kwargs: 10.0)
+    monkeypatch.setattr(
+        "tastepack.cli.analyze_video",
+        lambda *args, **kwargs: TasteAnalysis.model_validate(MOCK_ANALYSIS),
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "process",
+            str(video),
+            "--out",
+            str(tmp_path / "claude-pack"),
+            "--mock-gemini",
+            "--no-pdf",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "Step: Analysis validation" in result.output
+    assert "Asset range is outside video duration" in result.output
+    assert not (tmp_path / "claude-pack").exists()
 
 
 def test_existing_output_directory_is_replaced_on_success(tmp_path):

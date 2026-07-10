@@ -789,6 +789,7 @@ source = { editable = "." }
 dependencies = [
     { name = "google-genai" },
     { name = "markdown" },
+    { name = "pillow" },
     { name = "pydantic" },
     { name = "pypdf" },
     { name = "python-dotenv" },
@@ -806,6 +807,7 @@ dev = [
 requires-dist = [
     { name = "google-genai", specifier = ">=1.0.0" },
     { name = "markdown", specifier = ">=3.6" },
+    { name = "pillow", specifier = ">=10.0.0" },
     { name = "pydantic", specifier = ">=2.7.0" },
     { name = "pypdf", specifier = ">=5.0.0" },
     { name = "python-dotenv", specifier = ">=1.0.1" },

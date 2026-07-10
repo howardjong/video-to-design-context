@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from tastepack.config import TastepackConfig
+from tastepack.frames import ExtractedFrame
 from tastepack.pdf import generate_pdf_from_markdown
 from tastepack.schema import AssetExample, PreferenceMoment, TasteAnalysis
 from tastepack.timestamps import format_timestamp
@@ -19,13 +20,25 @@ def _moments_for_asset(analysis: TasteAnalysis, asset: AssetExample) -> list[Pre
     return [moment for moment in analysis.preference_moments if moment.asset_id == asset.id]
 
 
-def _frame_for_timestamp(frame_map: dict[float, str], seconds: float) -> str | None:
-    return frame_map.get(round(seconds, 3))
+def _frame_for_timestamp(
+    extracted_frames: list[ExtractedFrame],
+    asset_id: str,
+    seconds: float,
+) -> ExtractedFrame | None:
+    target = round(seconds, 3)
+    return next(
+        (
+            frame
+            for frame in extracted_frames
+            if frame.asset_id == asset_id and round(frame.timestamp_seconds, 3) == target
+        ),
+        None,
+    )
 
 
 def build_taste_packet_markdown(
     analysis: TasteAnalysis,
-    frame_map: dict[float, str],
+    extracted_frames: list[ExtractedFrame],
     source_video_name: str,
 ) -> str:
     lines = [
@@ -59,8 +72,8 @@ def build_taste_packet_markdown(
             ]
         )
         for moment in _moments_for_asset(analysis, asset):
-            frame_path = _frame_for_timestamp(frame_map, moment.timestamp_seconds)
-            frame_note = f" Frame: `{frame_path}`." if frame_path else ""
+            frame = _frame_for_timestamp(extracted_frames, asset.id, moment.timestamp_seconds)
+            frame_note = f" Frame: `{frame.relative_path}`." if frame else ""
             lines.append(
                 "- "
                 f"{format_timestamp(moment.timestamp_seconds)} "
@@ -118,13 +131,13 @@ def build_design_preferences_markdown(analysis: TasteAnalysis) -> str:
 def generate_artifacts(
     output_dir: Path,
     analysis: TasteAnalysis,
-    frame_map: dict[float, str],
+    extracted_frames: list[ExtractedFrame],
     config: TastepackConfig,
     source_video_name: str,
     source_video_metadata: dict | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    taste_packet = build_taste_packet_markdown(analysis, frame_map, source_video_name)
+    taste_packet = build_taste_packet_markdown(analysis, extracted_frames, source_video_name)
     design_preferences = build_design_preferences_markdown(analysis)
     (output_dir / "taste_packet.md").write_text(taste_packet, encoding="utf-8")
     (output_dir / "design_preferences.md").write_text(design_preferences, encoding="utf-8")
@@ -139,7 +152,7 @@ def generate_artifacts(
         "gemini_model": config.gemini_model,
         "assets_count": len(analysis.assets),
         "preference_moments_count": len(analysis.preference_moments),
-        "frames": frame_map,
+        "frames": [frame.to_metadata() for frame in extracted_frames],
         "config": config.model_dump(exclude={"request_timeout_seconds"}),
     }
     (output_dir / "metadata.json").write_text(
