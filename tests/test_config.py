@@ -15,6 +15,21 @@ def test_default_model_is_gemini_3_5_flash():
     assert config.cleanup_uploaded_files is True
 
 
+def test_default_config_has_separate_gemini_operation_timeouts():
+    config = TastepackConfig()
+
+    assert getattr(config, "gemini_upload_timeout_seconds", None) == 600
+    assert getattr(config, "gemini_file_processing_timeout_seconds", None) == 600
+    assert getattr(config, "gemini_generation_timeout_seconds", None) == 300
+    assert getattr(config, "gemini_cleanup_timeout_seconds", None) == 30
+
+
+def test_legacy_request_timeout_configures_file_processing_timeout():
+    config = TastepackConfig.model_validate({"request_timeout_seconds": 42})
+
+    assert config.gemini_file_processing_timeout_seconds == 42
+
+
 def test_config_values_can_be_loaded_from_file_and_cli_overrides(tmp_path):
     config_path = tmp_path / "tastepack.json"
     config_path.write_text(

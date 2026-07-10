@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class TastepackConfig(BaseModel):
@@ -21,7 +21,25 @@ class TastepackConfig(BaseModel):
     allow_no_audio: bool = False
     gemini_max_retries: int = Field(default=3, ge=1)
     gemini_retry_base_delay_seconds: float = Field(default=1.0, gt=0)
+    gemini_retry_jitter_seconds: float = Field(default=0.25, ge=0)
+    gemini_upload_timeout_seconds: float = Field(default=600.0, gt=0)
+    gemini_file_processing_timeout_seconds: float = Field(default=600.0, gt=0)
+    gemini_generation_timeout_seconds: float = Field(default=300.0, gt=0)
+    gemini_cleanup_timeout_seconds: float = Field(default=30.0, gt=0)
     cleanup_uploaded_files: bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_request_timeout(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        if (
+            "gemini_file_processing_timeout_seconds" not in values
+            and "request_timeout_seconds" in values
+        ):
+            values = dict(values)
+            values["gemini_file_processing_timeout_seconds"] = values["request_timeout_seconds"]
+        return values
 
     @classmethod
     def from_sources(
