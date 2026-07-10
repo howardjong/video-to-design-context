@@ -19,7 +19,11 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from tastepack.artifacts import validate_complete_metadata
+from tastepack.artifacts import (
+    create_delivery_archive,
+    delivery_packet_metadata,
+    validate_complete_metadata,
+)
 from tastepack.config import TastepackConfig
 from tastepack.gemini import GEMINI_PROMPT_VERSION, GEMINI_SCHEMA_VERSION
 from tastepack.logging import get_logger, job_log_context, redact_secrets
@@ -953,7 +957,9 @@ def _annotate_pack(output_dir: Path, manifest: dict[str, Any]) -> None:
     }
     if isinstance(manifest.get("analysis_input"), dict):
         payload["queue"]["analysis_input"] = manifest["analysis_input"]
+    payload["delivery_packet"] = delivery_packet_metadata()
     _atomic_write_json(metadata_path, payload)
+    create_delivery_archive(output_dir)
     validate_complete_metadata(output_dir)
 
 

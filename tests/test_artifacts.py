@@ -1,4 +1,5 @@
 import json
+import zipfile
 
 import pytest
 from PIL import Image
@@ -101,6 +102,17 @@ def test_markdown_artifacts_include_traceability_and_grouped_assets(tmp_path):
     assert "Presentation Preferences" in design_preferences
     assert "Reusable Design Rules" in design_preferences
     assert metadata["source_video"] == "input.mp4"
+    assert metadata["delivery_packet"] == {"path": "taste_packet.zip", "format": "zip"}
+    with zipfile.ZipFile(tmp_path / "taste_packet.zip") as archive:
+        assert set(archive.namelist()) == {
+            "analysis.json",
+            "design_preferences.md",
+            "frames/asset-1_000012500.jpg",
+            "metadata.json",
+            "taste_packet.md",
+            "transcript.md",
+        }
+        assert json.loads(archive.read("metadata.json")) == metadata
 
 
 def test_api_keys_are_never_written_to_artifacts(tmp_path, monkeypatch):
@@ -118,6 +130,22 @@ def test_api_keys_are_never_written_to_artifacts(tmp_path, monkeypatch):
     for artifact in tmp_path.glob("*"):
         if artifact.is_file():
             assert "super-secret-key" not in artifact.read_text(errors="ignore")
+
+
+def test_delivery_archive_includes_pdf_when_enabled(tmp_path):
+    analysis = TasteAnalysis.model_validate(valid_payload())
+
+    generate_artifacts(
+        output_dir=tmp_path,
+        analysis=analysis,
+        extracted_frames=[],
+        config=TastepackConfig(produce_pdf=True),
+        source_video_name="input.mp4",
+    )
+
+    with zipfile.ZipFile(tmp_path / "taste_packet.zip") as archive:
+        assert "taste_packet.pdf" in archive.namelist()
+        assert archive.testzip() is None
 
 
 def test_multiple_assets_produce_separate_grouped_sections(tmp_path):

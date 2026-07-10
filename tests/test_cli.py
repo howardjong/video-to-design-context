@@ -51,6 +51,7 @@ def test_cli_accepts_video_and_output_directory_in_mock_mode(tmp_path):
 
     assert result.exit_code == 0, result.output
     assert (output_dir / "taste_packet.md").exists()
+    assert (output_dir / "taste_packet.zip").exists()
     assert (output_dir / "design_preferences.md").exists()
     assert (output_dir / "transcript.md").exists()
     assert json.loads((output_dir / "metadata.json").read_text())["source_video"] == video.name

@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 import pytest
 
+from tastepack.artifacts import refresh_delivery_archive
 from tastepack.config import TastepackConfig
 from tastepack.gemini import MOCK_ANALYSIS
 from tastepack.inbox_queue import (
@@ -31,6 +33,7 @@ def write_complete_pack(output_dir: Path, source_hash: str) -> None:
     (output_dir / "metadata.json").write_text(
         json.dumps({"run_status": "complete", "source_sha256": source_hash})
     )
+    refresh_delivery_archive(output_dir)
 
 
 def test_inbox_processes_multiple_jobs_and_archives_sources(tmp_path: Path) -> None:
@@ -174,6 +177,9 @@ def test_silent_bundle_uses_companion_audio_in_one_private_analysis_mp4(
     assert not list(paths.archive.rglob("analysis-input.mp4"))
     metadata = json.loads((paths.output / job["output_path"] / "metadata.json").read_text())
     assert metadata["queue"]["analysis_input"] == job["analysis_input"]
+    with zipfile.ZipFile(paths.output / job["output_path"] / "taste_packet.zip") as archive:
+        archived_metadata = json.loads(archive.read("metadata.json"))
+    assert archived_metadata["queue"]["analysis_input"] == job["analysis_input"]
 
 
 def test_invalid_asset_bundle_moves_entire_bundle_to_failed_and_continues(tmp_path: Path) -> None:

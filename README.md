@@ -204,6 +204,7 @@ claude-pack/
   design_preferences.md
   taste_packet.md
   taste_packet.pdf
+  taste_packet.zip
   transcript.md
   metadata.json
   frames/
@@ -241,6 +242,10 @@ accuracy, evidence fidelity, traceability, cost, and latency before adoption.
 layout, information hierarchy, typography, color, motion, interaction details,
 dashboard-specific preferences, presentation-specific preferences, and negative
 preferences.
+
+`taste_packet.zip` is the complete model-delivery artifact. It contains every output
+artifact except itself, preserving the `frames/` paths referenced by `taste_packet.md`.
+It never includes source media, inbox/job logs, or temporary processing files.
 
 The run is hard-fail by default. If Gemini analysis, frame extraction, Markdown
 generation, metadata writing, or PDF generation fails, `tastepack` removes its

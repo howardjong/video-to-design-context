@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import zipfile
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from tastepack.config import TastepackConfig
 from tastepack.frames import ExtractedFrame
@@ -12,6 +14,7 @@ from tastepack.timestamps import format_timestamp
 
 ANALYSIS_SCHEMA_VERSION = "tastepack-analysis-v1"
 ARTIFACT_SCHEMA_VERSION = "tastepack-artifact-v1"
+DELIVERY_ARCHIVE_NAME = "taste_packet.zip"
 
 
 class ArtifactGenerationError(RuntimeError):
@@ -255,12 +258,62 @@ def generate_artifacts(
         "preference_moments_count": len(analysis.preference_moments),
         "frames": [frame.to_metadata() for frame in extracted_frames],
         "config": config.model_dump(exclude={"request_timeout_seconds"}),
+        "delivery_packet": delivery_packet_metadata(),
     }
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    create_delivery_archive(output_dir)
     validate_complete_metadata(output_dir)
+
+
+def delivery_packet_metadata() -> dict[str, str]:
+    return {
+        "path": DELIVERY_ARCHIVE_NAME,
+        "format": "zip",
+    }
+
+
+def create_delivery_archive(output_dir: Path) -> Path:
+    """Atomically package every delivery artifact without including the archive itself."""
+    archive_path = output_dir / DELIVERY_ARCHIVE_NAME
+    members = sorted(
+        (
+            path
+            for path in output_dir.rglob("*")
+            if path.is_file() and path != archive_path
+        ),
+        key=lambda path: path.relative_to(output_dir).as_posix(),
+    )
+    temporary_path = output_dir / f".{DELIVERY_ARCHIVE_NAME}.{uuid4().hex}.tmp"
+    try:
+        with zipfile.ZipFile(
+            temporary_path,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+        ) as archive:
+            for path in members:
+                archive.write(path, path.relative_to(output_dir).as_posix())
+        temporary_path.replace(archive_path)
+    except Exception as exc:
+        temporary_path.unlink(missing_ok=True)
+        raise ArtifactGenerationError(f"Could not create {DELIVERY_ARCHIVE_NAME}") from exc
+    return archive_path
+
+
+def refresh_delivery_archive(output_dir: Path) -> Path:
+    """Backfill or refresh the model-delivery archive for an existing complete pack."""
+    metadata_path = output_dir / "metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ArtifactGenerationError("metadata.json is missing or invalid") from exc
+    metadata["delivery_packet"] = delivery_packet_metadata()
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8")
+    archive_path = create_delivery_archive(output_dir)
+    validate_complete_metadata(output_dir)
+    return archive_path
 
 
 def validate_staged_pack(
@@ -306,3 +359,33 @@ def validate_complete_metadata(output_dir: Path) -> None:
         raise ArtifactGenerationError("metadata.json is missing or invalid") from exc
     if metadata.get("run_status") != "complete":
         raise ArtifactGenerationError("metadata.json was not marked complete")
+    expected_delivery_packet = delivery_packet_metadata()
+    if metadata.get("delivery_packet") != expected_delivery_packet:
+        raise ArtifactGenerationError("metadata.json does not describe the delivery archive")
+    _validate_delivery_archive(output_dir)
+
+
+def _validate_delivery_archive(output_dir: Path) -> None:
+    archive_path = output_dir / DELIVERY_ARCHIVE_NAME
+    if not archive_path.is_file() or archive_path.stat().st_size == 0:
+        raise ArtifactGenerationError(
+            f"Required artifact is missing or empty: {DELIVERY_ARCHIVE_NAME}"
+        )
+    expected_members = {
+        path.relative_to(output_dir).as_posix()
+        for path in output_dir.rglob("*")
+        if path.is_file() and path != archive_path
+    }
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            if corrupt_member := archive.testzip():
+                raise ArtifactGenerationError(
+                    f"Delivery archive contains a corrupt member: {corrupt_member}"
+                )
+            archive_members = set(archive.namelist())
+    except ArtifactGenerationError:
+        raise
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ArtifactGenerationError(f"{DELIVERY_ARCHIVE_NAME} is invalid") from exc
+    if archive_members != expected_members:
+        raise ArtifactGenerationError(f"{DELIVERY_ARCHIVE_NAME} does not match output artifacts")
