@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -135,6 +136,8 @@ def run_processing_job(
     mock_payload: Path | None = None,
     skip_ffmpeg: bool = False,
     preflight_metadata: dict[str, object] | None = None,
+    gemini_permit: Callable[[], Any] | None = None,
+    retry_observer: Callable[[float, BaseException], None] | None = None,
     dependencies: PipelineDependencies | None = None,
 ) -> PipelineResult:
     dependencies = dependencies or PipelineDependencies(promote_output=promote_output)
@@ -164,17 +167,23 @@ def run_processing_job(
             duration = None
 
         gemini_telemetry = GeminiRunTelemetry()
+        def analyze_with_provider_permit() -> TasteAnalysis:
+            context = gemini_permit() if gemini_permit is not None else nullcontext()
+            with context:
+                return dependencies.analyze_video(
+                    input_video,
+                    config,
+                    mock=mock_gemini,
+                    mock_payload_path=mock_payload,
+                    telemetry=gemini_telemetry,
+                    video_duration_seconds=duration,
+                    retry_observer=retry_observer,
+                )
+
         analysis = run_step(
             "Gemini analysis",
             "Fix the Gemini response/schema issue or retry after resolving API availability.",
-            lambda: dependencies.analyze_video(
-                input_video,
-                config,
-                mock=mock_gemini,
-                mock_payload_path=mock_payload,
-                telemetry=gemini_telemetry,
-                video_duration_seconds=duration,
-            ),
+            analyze_with_provider_permit,
             FailureCategory.PROVIDER,
         )
         analysis = run_step(

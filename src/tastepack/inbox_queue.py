@@ -6,8 +6,10 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -24,11 +26,75 @@ from tastepack.video import VideoValidationError, validate_input_video
 
 logger = get_logger("inbox")
 SUPPORTED_EXTENSIONS = {".mp4", ".mov"}
-TERMINAL_STATES = {"complete", "failed", "skipped", "recovery_required"}
+TERMINAL_STATES = {"complete", "deferred", "failed", "skipped", "recovery_required"}
 
 
 class QueueLockedError(RuntimeError):
     pass
+
+
+class ProviderCircuitOpen(RuntimeError):
+    pass
+
+
+class ProviderCircuitBreaker:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._reason: str | None = None
+
+    @property
+    def reason(self) -> str | None:
+        with self._lock:
+            return self._reason
+
+    def trip(self, reason: str) -> None:
+        with self._lock:
+            self._reason = self._reason or reason
+
+    def require_closed(self) -> None:
+        if reason := self.reason:
+            raise ProviderCircuitOpen(f"Gemini circuit breaker is open: {reason}")
+
+
+class GeminiGate:
+    def __init__(
+        self,
+        concurrency: int,
+        circuit_breaker: ProviderCircuitBreaker,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if concurrency < 1:
+            raise ValueError("gemini_concurrency must be at least 1")
+        self._semaphore = threading.BoundedSemaphore(concurrency)
+        self._circuit_breaker = circuit_breaker
+        self._sleep = sleep
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._next_allowed_at = 0.0
+
+    @contextmanager
+    def permit(self):
+        self._circuit_breaker.require_closed()
+        with self._semaphore:
+            while True:
+                self._circuit_breaker.require_closed()
+                with self._lock:
+                    delay = self._next_allowed_at - self._clock()
+                if delay <= 0:
+                    break
+                self._sleep(delay)
+            try:
+                yield
+            except Exception as exc:
+                self._circuit_breaker.trip(redact_secrets(exc))
+                raise
+
+    def observe_retry(self, delay_seconds: float, exc: BaseException) -> None:
+        if _error_code(exc) != 429:
+            return
+        with self._lock:
+            self._next_allowed_at = max(self._next_allowed_at, self._clock() + delay_seconds)
 
 
 @dataclass(frozen=True)
@@ -90,6 +156,7 @@ class QueueSummary:
     completed: int = 0
     failed: int = 0
     skipped: int = 0
+    deferred: int = 0
     halted: bool = False
     halt_reason: str | None = None
 
@@ -123,6 +190,8 @@ def process_inbox(
     *,
     stable_seconds: float = 10.0,
     max_jobs: int | None = None,
+    workers: int = 1,
+    gemini_concurrency: int = 1,
     force: bool = False,
     mock_gemini: bool = False,
     mock_payload: Path | None = None,
@@ -131,50 +200,153 @@ def process_inbox(
     runner: Callable[..., Any] = run_processing_job,
     sleep: Callable[[float], None] = time.sleep,
 ) -> QueueSummary:
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+    if gemini_concurrency < 1:
+        raise ValueError("gemini_concurrency must be at least 1")
     paths = IntakePaths.from_root(root)
     paths.ensure()
     summary = QueueSummary()
+    circuit_breaker = ProviderCircuitBreaker()
+    gemini_gate = GeminiGate(gemini_concurrency, circuit_breaker, sleep=sleep)
 
     with acquire_dispatcher_lock(paths):
         _recover_promoted_jobs(paths, summary)
-        for source in discover_stable_inputs(paths, stable_seconds=stable_seconds, sleep=sleep):
-            if max_jobs is not None and len(summary.jobs) >= max_jobs:
-                break
-            manifest = claim_input(paths, source)
-            try:
-                _process_claimed_job(
-                    paths,
-                    manifest,
-                    config,
-                    force=force,
-                    mock_gemini=mock_gemini,
-                    mock_payload=mock_payload,
-                    skip_ffmpeg=skip_ffmpeg,
-                    preflight=preflight,
-                    runner=runner,
-                )
-            except PipelineFailure as exc:
-                _record_failure(paths, manifest, exc.category, exc)
-                if exc.category is not FailureCategory.INPUT:
+        if summary.halted:
+            return summary
+        sources = iter(discover_stable_inputs(paths, stable_seconds=stable_seconds, sleep=sleep))
+        pending: dict[Future[dict[str, Any]], dict[str, Any]] = {}
+        exhausted = False
+        claimed_count = 0
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="tastepack-inbox",
+        ) as executor:
+            while pending or not exhausted:
+                while (
+                    not exhausted
+                    and not circuit_breaker.reason
+                    and len(pending) < workers
+                    and (max_jobs is None or claimed_count < max_jobs)
+                ):
+                    try:
+                        source = next(sources)
+                    except StopIteration:
+                        exhausted = True
+                        break
+                    manifest = claim_input(paths, source)
+                    claimed_count += 1
+                    future = executor.submit(
+                        _execute_claimed_job,
+                        paths,
+                        manifest,
+                        config,
+                        force=force,
+                        mock_gemini=mock_gemini,
+                        mock_payload=mock_payload,
+                        skip_ffmpeg=skip_ffmpeg,
+                        preflight=preflight,
+                        runner=runner,
+                        circuit_breaker=circuit_breaker,
+                        gemini_gate=gemini_gate,
+                    )
+                    pending[future] = manifest
+                if not pending:
+                    break
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    manifest = pending.pop(future)
+                    try:
+                        future.result()
+                    except Exception as exc:  # Defensive boundary for worker bugs.
+                        _record_failure(paths, manifest, FailureCategory.SYSTEM, exc)
+                        circuit_breaker.trip(redact_secrets(exc))
+                    _record_summary(summary, manifest)
+                if circuit_breaker.reason:
                     summary.halted = True
-                    summary.halt_reason = redact_secrets(exc)
-            except VideoValidationError as exc:
-                _record_failure(paths, manifest, FailureCategory.INPUT, exc)
-            except Exception as exc:
-                _record_failure(paths, manifest, FailureCategory.SYSTEM, exc)
-                summary.halted = True
-                summary.halt_reason = redact_secrets(exc)
-
-            summary.jobs.append(manifest)
-            if manifest["status"] == "complete":
-                summary.completed += 1
-            elif manifest["status"] == "skipped":
-                summary.skipped += 1
-            else:
-                summary.failed += 1
-            if summary.halted:
-                break
+                    summary.halt_reason = circuit_breaker.reason
     return summary
+
+
+def watch_inbox(
+    root: Path,
+    config: TastepackConfig,
+    *,
+    poll_seconds: float = 2.0,
+    stop_event: threading.Event | None = None,
+    on_summary: Callable[[QueueSummary], None] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    **process_options: Any,
+) -> QueueSummary:
+    if poll_seconds < 0:
+        raise ValueError("poll_seconds must be non-negative")
+    stop_event = stop_event or threading.Event()
+    summary = QueueSummary()
+    while not stop_event.is_set():
+        summary = process_inbox(root, config, sleep=sleep, **process_options)
+        if on_summary is not None:
+            on_summary(summary)
+        if summary.halted or stop_event.is_set():
+            return summary
+        sleep(poll_seconds)
+    return summary
+
+
+def _execute_claimed_job(
+    paths: IntakePaths,
+    manifest: dict[str, Any],
+    config: TastepackConfig,
+    *,
+    force: bool,
+    mock_gemini: bool,
+    mock_payload: Path | None,
+    skip_ffmpeg: bool,
+    preflight: Callable[..., dict[str, object]],
+    runner: Callable[..., Any],
+    circuit_breaker: ProviderCircuitBreaker,
+    gemini_gate: GeminiGate,
+) -> dict[str, Any]:
+    try:
+        _process_claimed_job(
+            paths,
+            manifest,
+            config,
+            force=force,
+            mock_gemini=mock_gemini,
+            mock_payload=mock_payload,
+            skip_ffmpeg=skip_ffmpeg,
+            preflight=preflight,
+            runner=runner,
+            gemini_permit=gemini_gate.permit,
+            retry_observer=gemini_gate.observe_retry,
+        )
+    except PipelineFailure as exc:
+        if _was_caused_by(exc, ProviderCircuitOpen):
+            _defer_claimed_job(paths, manifest, redact_secrets(exc))
+        else:
+            _record_failure(paths, manifest, exc.category, exc)
+            if exc.category is not FailureCategory.INPUT:
+                circuit_breaker.trip(redact_secrets(exc))
+    except ProviderCircuitOpen as exc:
+        _defer_claimed_job(paths, manifest, redact_secrets(exc))
+    except VideoValidationError as exc:
+        _record_failure(paths, manifest, FailureCategory.INPUT, exc)
+    except Exception as exc:
+        _record_failure(paths, manifest, FailureCategory.SYSTEM, exc)
+        circuit_breaker.trip(redact_secrets(exc))
+    return manifest
+
+
+def _record_summary(summary: QueueSummary, manifest: dict[str, Any]) -> None:
+    summary.jobs.append(manifest)
+    if manifest["status"] == "complete":
+        summary.completed += 1
+    elif manifest["status"] == "skipped":
+        summary.skipped += 1
+    elif manifest["status"] == "deferred":
+        summary.deferred += 1
+    else:
+        summary.failed += 1
 
 
 def discover_stable_inputs(
@@ -256,6 +428,8 @@ def _process_claimed_job(
     skip_ffmpeg: bool,
     preflight: Callable[..., dict[str, object]],
     runner: Callable[..., Any],
+    gemini_permit: Callable[[], Any],
+    retry_observer: Callable[[float, BaseException], None],
 ) -> None:
     claimed_path = paths.processing / manifest["claimed_path"]
     video_metadata = preflight(claimed_path, require_tools=not skip_ffmpeg, config=config)
@@ -298,6 +472,8 @@ def _process_claimed_job(
         mock_payload=mock_payload,
         skip_ffmpeg=skip_ffmpeg,
         preflight_metadata=video_metadata,
+        gemini_permit=gemini_permit,
+        retry_observer=retry_observer,
     )
     if not _is_complete_pack(output_dir, source_hash):
         raise PipelineFailure(
@@ -391,6 +567,20 @@ def _record_failure(
             "reason": reason,
             "next": next_step,
         },
+    )
+
+
+def _defer_claimed_job(paths: IntakePaths, manifest: dict[str, Any], reason: str) -> None:
+    claimed_path = paths.processing / manifest["claimed_path"]
+    destination = _unique_destination(paths.inbox / manifest["source_name"])
+    if claimed_path.exists():
+        claimed_path.replace(destination)
+    _transition(
+        paths,
+        manifest,
+        "deferred",
+        deferred_path=destination.name,
+        deferred_reason=reason,
     )
 
 
@@ -509,3 +699,20 @@ def _hash_json(payload: dict[str, Any]) -> str:
 
 def _timestamp() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _error_code(exc: BaseException) -> int | None:
+    for attribute in ("status_code", "code"):
+        value = getattr(exc, attribute, None)
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _was_caused_by(exc: BaseException, error_type: type[BaseException]) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, error_type):
+            return True
+        current = current.__cause__
+    return False

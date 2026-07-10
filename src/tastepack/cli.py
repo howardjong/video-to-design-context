@@ -19,6 +19,9 @@ from tastepack.inbox_queue import (
 from tastepack.inbox_queue import (
     process_inbox as run_inbox,
 )
+from tastepack.inbox_queue import (
+    watch_inbox as run_inbox_watch,
+)
 from tastepack.logging import configure_logging, get_logger, redact_secrets
 from tastepack.pipeline import PipelineDependencies, PipelineFailure, run_processing_job
 from tastepack.schema import TasteAnalysis
@@ -241,7 +244,21 @@ def process_inbox_command(
         min=0,
         help="Require unchanged file size and mtime for this duration before claiming.",
     ),
+    watch: bool = typer.Option(False, "--watch", help="Continue watching the inbox after a drain."),
+    poll_seconds: float = typer.Option(
+        2.0,
+        "--poll-seconds",
+        min=0,
+        help="Delay between inbox scans in watch mode.",
+    ),
     max_jobs: int | None = typer.Option(None, "--max-jobs", min=1),
+    workers: int = typer.Option(1, "--workers", min=1, help="Maximum concurrent local jobs."),
+    gemini_concurrency: int = typer.Option(
+        1,
+        "--gemini-concurrency",
+        min=1,
+        help="Maximum concurrent Gemini video analyses.",
+    ),
     force: bool = typer.Option(False, "--force", help="Reprocess matching completed output."),
     verbosity: str | None = typer.Option(None, "--verbosity", help="quiet, normal, or debug."),
     log_file: Path | None = typer.Option(None, "--log-file", help="Write troubleshooting logs."),
@@ -300,16 +317,29 @@ def process_inbox_command(
             )
         config = TastepackConfig.from_sources(config_file, overrides)
         configure_logging(config.verbosity, effective_log_file)
-        summary = run_inbox(
-            data_dir,
-            config,
-            stable_seconds=stable_seconds,
-            max_jobs=max_jobs,
-            force=force,
-            mock_gemini=mock_gemini,
-            mock_payload=mock_payload,
-            skip_ffmpeg=skip_ffmpeg,
-        )
+        inbox_options = {
+            "stable_seconds": stable_seconds,
+            "max_jobs": max_jobs,
+            "workers": workers,
+            "gemini_concurrency": gemini_concurrency,
+            "force": force,
+            "mock_gemini": mock_gemini,
+            "mock_payload": mock_payload,
+            "skip_ffmpeg": skip_ffmpeg,
+        }
+        if watch:
+            try:
+                summary = run_inbox_watch(
+                    data_dir,
+                    config,
+                    poll_seconds=poll_seconds,
+                    **inbox_options,
+                )
+            except KeyboardInterrupt:
+                typer.echo("Inbox watch stopped; active jobs were allowed to settle.", err=True)
+                raise typer.Exit(code=130) from None
+        else:
+            summary = run_inbox(data_dir, config, **inbox_options)
     except (PipelineStepError, QueueLockedError, ValueError, RuntimeError) as exc:
         raise typer.BadParameter(redact_secrets(exc)) from exc
 
@@ -329,7 +359,7 @@ def process_inbox_command(
             )
     typer.echo(
         f"Inbox summary: {summary.completed} complete, {summary.skipped} skipped, "
-        f"{summary.failed} failed. Log: {effective_log_file}"
+        f"{summary.failed} failed, {summary.deferred} deferred. Log: {effective_log_file}"
     )
     if summary.halted:
         typer.echo(

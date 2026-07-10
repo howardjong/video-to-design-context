@@ -216,6 +216,7 @@ def call_with_retries(
     operation_name: str = "Gemini operation",
     retry_ambiguous_transport_errors: bool = True,
     on_attempt: Callable[[int], None] | None = None,
+    on_retry: Callable[[float, BaseException], None] | None = None,
 ) -> Any:
     attempt = 1
     while True:
@@ -234,6 +235,8 @@ def call_with_retries(
             if delay is None:
                 delay = config.gemini_retry_base_delay_seconds * (2 ** (attempt - 1))
                 delay += random.uniform(0, config.gemini_retry_jitter_seconds)
+            if on_retry is not None:
+                on_retry(delay, exc)
             logger.warning(
                 "%s attempt %s failed with retryable error; retrying in %.1fs: %s",
                 operation_name,
@@ -252,6 +255,7 @@ def call_with_telemetry(
     telemetry: GeminiRunTelemetry | None = None,
     sleep: Callable[[float], None] = time.sleep,
     retry_ambiguous_transport_errors: bool = True,
+    on_retry: Callable[[float, BaseException], None] | None = None,
 ) -> Any:
     started_at = time.monotonic()
     try:
@@ -261,6 +265,7 @@ def call_with_telemetry(
             sleep=sleep,
             operation_name=operation_name,
             retry_ambiguous_transport_errors=retry_ambiguous_transport_errors,
+            on_retry=on_retry,
             on_attempt=(
                 lambda _attempt: (
                     telemetry.record_attempt(operation_name) if telemetry is not None else None
@@ -287,6 +292,7 @@ def wait_for_file_active(
     sleep: Callable[[float], None] = time.sleep,
     config: TastepackConfig | None = None,
     telemetry: GeminiRunTelemetry | None = None,
+    retry_observer: Callable[[float, BaseException], None] | None = None,
 ) -> Any:
     deadline = time.monotonic() + timeout_seconds
     current_file = uploaded_file
@@ -301,6 +307,7 @@ def wait_for_file_active(
             operation_name="file_status",
             telemetry=telemetry,
             sleep=sleep,
+            on_retry=retry_observer,
         )
         state = _state_name(current_file).upper()
         if telemetry is not None:
@@ -443,6 +450,7 @@ def cleanup_uploaded_files(
     upload_display_name: str,
     config: TastepackConfig,
     telemetry: GeminiRunTelemetry | None = None,
+    retry_observer: Callable[[float, BaseException], None] | None = None,
 ) -> None:
     """Best-effort cleanup that never overrides the run's primary outcome."""
     file_names = {
@@ -454,6 +462,7 @@ def cleanup_uploaded_files(
             config,
             operation_name="cleanup_list",
             telemetry=telemetry,
+            on_retry=retry_observer,
         )
         for remote_file in remote_files:
             if getattr(remote_file, "display_name", None) == upload_display_name:
@@ -476,6 +485,7 @@ def cleanup_uploaded_files(
                 config,
                 operation_name="cleanup_delete",
                 telemetry=telemetry,
+                on_retry=retry_observer,
             )
         except Exception as cleanup_exc:
             logger.warning(
@@ -491,6 +501,7 @@ def analyze_video(
     mock_payload_path: Path | None = None,
     telemetry: GeminiRunTelemetry | None = None,
     video_duration_seconds: float | None = None,
+    retry_observer: Callable[[float, BaseException], None] | None = None,
 ) -> TasteAnalysis:
     started_at = time.monotonic()
     if mock:
@@ -523,6 +534,7 @@ def analyze_video(
             operation_name="upload",
             telemetry=telemetry,
             retry_ambiguous_transport_errors=False,
+            on_retry=retry_observer,
         )
         logger.debug("Uploaded video to Gemini Files API as %s", uploaded.name)
         active_file = wait_for_file_active(
@@ -531,6 +543,7 @@ def analyze_video(
             timeout_seconds=config.gemini_file_processing_timeout_seconds,
             config=config,
             telemetry=telemetry,
+            retry_observer=retry_observer,
         )
         logger.debug("Gemini file %s is ACTIVE", active_file.name)
         segments = build_segment_plan(video_duration_seconds, config)
@@ -565,6 +578,7 @@ def analyze_video(
                 operation_name=operation_name,
                 telemetry=telemetry,
                 retry_ambiguous_transport_errors=False,
+                on_retry=retry_observer,
             )
             _record_response_telemetry(response, telemetry)
             segment_analysis = parse_gemini_json(response.text or "")
@@ -590,6 +604,7 @@ def analyze_video(
                 upload_display_name,
                 config,
                 telemetry,
+                retry_observer,
             )
         try:
             client.close()
