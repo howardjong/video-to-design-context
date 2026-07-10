@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import tempfile
 from pathlib import Path
+from uuid import uuid4
 
 import typer
 
@@ -40,6 +41,19 @@ def run_step(step: str, next_step: str, callback):
     return result
 
 
+def validate_output_paths(out: Path, log_file: Path | None) -> None:
+    if log_file and log_file.resolve().is_relative_to(out.resolve()):
+        raise ValueError(f"Log file cannot be inside the output directory: {log_file}")
+    if out.exists() and not out.is_dir():
+        raise ValueError(f"Output path exists and is not a directory: {out}")
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        probe_dir = Path(tempfile.mkdtemp(prefix=f".{out.name}.preflight-", dir=out.parent))
+        shutil.rmtree(probe_dir)
+    except OSError as exc:
+        raise ValueError(f"Output parent is not writable: {out.parent}: {exc}") from exc
+
+
 @app.callback()
 def main() -> None:
     """Create Claude-ready design taste context packs from narrated videos."""
@@ -60,13 +74,17 @@ def process(
     ),
     max_frames_per_asset: int | None = typer.Option(None, "--max-frames-per-asset", min=1),
     max_total_frames: int | None = typer.Option(None, "--max-total-frames", min=1),
-    produce_pdf: bool = typer.Option(True, "--pdf/--no-pdf", help="Generate taste_packet.pdf."),
+    produce_pdf: bool | None = typer.Option(
+        None,
+        "--pdf/--no-pdf",
+        help="Generate taste_packet.pdf.",
+    ),
     fallback_interval_seconds: float | None = typer.Option(None, "--fallback-interval", min=0.1),
     max_duration_seconds: float | None = typer.Option(None, "--max-duration-seconds", min=0.1),
     max_file_size_mb: float | None = typer.Option(None, "--max-file-size-mb", min=0.1),
-    allow_no_audio: bool = typer.Option(
-        False,
-        "--allow-no-audio",
+    allow_no_audio: bool | None = typer.Option(
+        None,
+        "--allow-no-audio/--require-audio",
         help="Allow visual-only videos.",
     ),
     gemini_max_retries: int | None = typer.Option(None, "--gemini-max-retries", min=1),
@@ -75,8 +93,8 @@ def process(
         "--gemini-retry-base-delay",
         min=0.1,
     ),
-    cleanup_uploaded_files: bool = typer.Option(
-        True,
+    cleanup_uploaded_files: bool | None = typer.Option(
+        None,
         "--cleanup-uploaded-files/--no-cleanup-uploaded-files",
         help="Delete Gemini Files API upload after processing.",
     ),
@@ -113,7 +131,25 @@ def process(
     }
     staging_dir: Path | None = None
     try:
+        configure_logging("normal")
+        run_step(
+            "Output preflight",
+            "Choose a log file outside --out and verify the output path.",
+            lambda: validate_output_paths(out, log_file),
+        )
         configure_logging("normal", log_file)
+        if skip_ffmpeg and not mock_gemini:
+            raise PipelineStepError(
+                "Configuration",
+                "--skip-ffmpeg requires --mock-gemini",
+                "Remove --skip-ffmpeg for a live run or add --mock-gemini for offline testing.",
+            )
+        if mock_payload and not mock_gemini:
+            raise PipelineStepError(
+                "Configuration",
+                "--mock-payload requires --mock-gemini",
+                "Add --mock-gemini to use a local analysis fixture.",
+            )
         config = run_step(
             "Configuration",
             "Check the config file JSON syntax and CLI flag values.",
@@ -215,11 +251,11 @@ def promote_output(staging_dir: Path, out: Path) -> None:
         return
     if not out.is_dir():
         raise RuntimeError(f"Output path exists and is not a directory: {out}")
-    for staged_path in staging_dir.rglob("*"):
-        relative_path = staged_path.relative_to(staging_dir)
-        destination = out / relative_path
-        if staged_path.is_dir():
-            destination.mkdir(parents=True, exist_ok=True)
-        else:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(staged_path, destination)
+    backup_dir = out.with_name(f".{out.name}.backup-{uuid4().hex}")
+    out.replace(backup_dir)
+    try:
+        staging_dir.replace(out)
+    except Exception:
+        backup_dir.replace(out)
+        raise
+    shutil.rmtree(backup_dir)
