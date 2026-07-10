@@ -12,13 +12,12 @@ from tastepack.config import TastepackConfig
 from tastepack.frames import extract_frames, select_frames_for_analysis
 from tastepack.gemini import (
     GeminiAnalysisError,
-    GeminiRunTelemetry,
     analyze_video,
-    build_gemini_provider_metadata,
 )
 from tastepack.logging import configure_logging, get_logger, redact_secrets
+from tastepack.pipeline import PipelineDependencies, PipelineFailure, run_processing_job
 from tastepack.schema import TasteAnalysis
-from tastepack.video import VideoValidationError, validate_input_video
+from tastepack.video import validate_input_video
 
 app = typer.Typer(help="Create Claude-ready design taste context packs from narrated videos.")
 logger = get_logger("cli")
@@ -149,7 +148,6 @@ def process(
         "cleanup_uploaded_files": cleanup_uploaded_files,
         "verbosity": verbosity,
     }
-    staging_dir: Path | None = None
     try:
         configure_logging("normal")
         run_step(
@@ -177,94 +175,24 @@ def process(
         )
         configure_logging(config.verbosity, log_file)
         logger.debug("Loaded configuration: %s", config.model_dump())
-        video_metadata = run_step(
-            "Video preflight",
-            "Verify the input path, format, ffmpeg/ffprobe installation, audio stream, "
-            "duration, and size before retrying.",
-            lambda: validate_input_video(
-                input_video,
-                require_tools=not skip_ffmpeg,
-                config=config,
+        run_processing_job(
+            input_video,
+            out,
+            config,
+            mock_gemini=mock_gemini,
+            mock_payload=mock_payload,
+            skip_ffmpeg=skip_ffmpeg,
+            dependencies=PipelineDependencies(
+                validate_input_video=validate_input_video,
+                analyze_video=analyze_video,
+                select_frames_for_analysis=select_frames_for_analysis,
+                extract_frames=extract_frames,
+                generate_artifacts=generate_artifacts,
+                promote_output=promote_output,
             ),
         )
-        duration = video_metadata.get("duration_seconds")
-        if not isinstance(duration, int | float) or isinstance(duration, bool):
-            duration = None
-        gemini_telemetry = GeminiRunTelemetry()
-        analysis = run_step(
-            "Gemini analysis",
-            "Fix the Gemini response/schema issue or retry after resolving API availability.",
-            lambda: analyze_video(
-                input_video,
-                config,
-                mock=mock_gemini,
-                mock_payload_path=mock_payload,
-                telemetry=gemini_telemetry,
-                video_duration_seconds=duration,
-            ),
-        )
-        analysis = run_step(
-            "Analysis validation",
-            "Record a shorter, clearer video or correct the Gemini analysis response "
-            "before retrying.",
-            lambda: validate_analysis_for_video(analysis, video_metadata, config),
-        )
-        selected_frames = run_step(
-            "Frame selection",
-            "Check Gemini suggested frames, confidence thresholds, and fallback interval.",
-            lambda: select_frames_for_analysis(
-                analysis,
-                config,
-                video_duration_seconds=duration,
-            ),
-        )
-        if not selected_frames:
-            raise PipelineStepError(
-                "Frame selection",
-                "No frames could be selected or generated",
-                "Lower frame confidence threshold or adjust fallback interval.",
-            )
-        out.parent.mkdir(parents=True, exist_ok=True)
-        staging_dir = Path(
-            tempfile.mkdtemp(prefix=f".{out.name}.tmp-", dir=str(out.parent))
-        )
-        logger.debug("Created staging directory: %s", staging_dir)
-        extracted_frames = run_step(
-            "Frame extraction",
-            "Check ffmpeg output and frame timestamps; rerun with --verbosity debug.",
-            lambda: extract_frames(
-                input_video,
-                selected_frames,
-                staging_dir,
-                skip_ffmpeg=skip_ffmpeg,
-                expected_source_metadata=video_metadata,
-                ffmpeg_timeout_seconds=config.frame_extraction_timeout_seconds,
-            ),
-        )
-        run_step(
-            "Artifact generation",
-            "Inspect output permissions and PDF generation settings; retry with --no-pdf.",
-            lambda: generate_artifacts(
-                staging_dir,
-                analysis,
-                extracted_frames,
-                config,
-                input_video.name,
-                source_video_metadata=video_metadata,
-                provider_metadata=build_gemini_provider_metadata(config, gemini_telemetry),
-            ),
-        )
-        run_step(
-            "Output promotion",
-            "Check that the output path is writable and is a directory.",
-            lambda: promote_output(staging_dir, out),
-        )
-        staging_dir = None
-    except (VideoValidationError, GeminiAnalysisError, ValueError, RuntimeError) as exc:
+    except (PipelineFailure, GeminiAnalysisError, ValueError, RuntimeError) as exc:
         raise typer.BadParameter(redact_secrets(exc)) from exc
-    finally:
-        if staging_dir is not None and staging_dir.exists():
-            shutil.rmtree(staging_dir, ignore_errors=True)
 
     typer.echo(f"Wrote tastepack output to {out}")
 
