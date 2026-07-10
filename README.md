@@ -129,18 +129,34 @@ redact API key values before writing to the terminal or log file.
 
 ## Inbox Queue
 
-For repeatable local processing, place videos in `tastepack-data/inbox/` and drain
-the queue:
+For repeatable local processing, place a video directly in `tastepack-data/inbox/`
+or place a self-contained asset bundle there and drain the queue:
 
 ```bash
 uv run tastepack process-inbox --data-dir ./tastepack-data
 ```
 
-Each source is atomically claimed, preflighted, fingerprinted, and processed into
-`output/<source-name>--<run-key>/`. Successful sources move to `archive/`; rejected
-inputs move to `failed/<job-id>/`; manifests and per-job logs live in `jobs/` and
-`logs/`. The source SHA-256 plus output-affecting configuration produces the run key,
-so exact duplicate content is skipped only after the earlier complete pack validates.
+Each direct video or bundle is atomically claimed, preflighted, fingerprinted, and
+processed into `output/<source-name>--<run-key>/`. A bundle is one non-hidden folder
+directly inside `inbox/` and must contain exactly one `.mp4` or `.mov` video,
+including in nested folders. Its name becomes the output source name. Other files,
+such as a narrated `.mp3` and timestamped `.md` transcript, are retained as local
+companions: they are recorded in the job manifest and move with the bundle to
+`archive/` or `failed/<job-id>/`, but only the selected video is sent to Gemini.
+
+For example:
+
+```text
+tastepack-data/inbox/van-holtz-site/
+  walkthrough.mp4
+  narration.mp3
+  transcript.md
+```
+
+Successful sources move to `archive/`; rejected inputs move to `failed/<job-id>/`;
+manifests and per-job logs live in `jobs/` and `logs/`. The source SHA-256 plus
+output-affecting configuration produces the run key, so exact duplicate content is
+skipped only after the earlier complete pack validates.
 
 Use bounded local workers while keeping Gemini conservative by default:
 
@@ -157,9 +173,10 @@ workers. A corrupt or unsupported source fails independently, but Gemini, schema
 frame, artifact, disk, permission, or promotion failures open the circuit breaker:
 no new source is claimed and unclaimed inputs remain in `inbox/`.
 
-Use `--watch --poll-seconds 2` to keep draining stable files after they have remained
-unchanged for `--stable-seconds` (default `10`). Watch mode does not process hidden,
-symlinked, unsupported, or actively changing files.
+Use `--watch --poll-seconds 2` to keep draining stable files or bundles after they
+have remained unchanged for `--stable-seconds` (default `10`). Watch mode does not
+process hidden, symlinked, unsupported, or actively changing inputs. Every file inside
+a bundle must remain stable before that bundle is claimed.
 
 Inspect and retry work without editing manifests:
 

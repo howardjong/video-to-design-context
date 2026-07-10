@@ -83,6 +83,41 @@ def test_cli_processes_inbox_in_mock_mode(tmp_path):
     assert json.loads(outputs[0].read_text())["queue"]["run_key"]
 
 
+def test_cli_processes_asset_bundle_in_mock_mode(tmp_path):
+    data_dir = tmp_path / "tastepack-data"
+    bundle = data_dir / "inbox" / "van-holtz-site"
+    bundle.mkdir(parents=True)
+    (bundle / "walkthrough.mp4").write_bytes(b"fake video for mocked mode")
+    (bundle / "narration.mp3").write_bytes(b"audio reference")
+    (bundle / "transcript.md").write_text("# Timestamped transcript\n", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "process-inbox",
+            "--data-dir",
+            str(data_dir),
+            "--mock-gemini",
+            "--skip-ffmpeg",
+            "--no-pdf",
+            "--stable-seconds",
+            "0",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(list((data_dir / "archive").rglob("walkthrough.mp4"))) == 1
+    assert len(list((data_dir / "archive").rglob("narration.mp3"))) == 1
+    assert len(list((data_dir / "archive").rglob("transcript.md"))) == 1
+    outputs = list((data_dir / "output").glob("van-holtz-site--*/metadata.json"))
+    assert len(outputs) == 1
+    manifest = next((data_dir / "jobs").glob("*.json"))
+    assert json.loads(manifest.read_text())["companion_assets"] == [
+        "narration.mp3",
+        "transcript.md",
+    ]
+
+
 def test_cli_queue_status_reports_pending_inputs_and_job_states(tmp_path):
     data_dir = tmp_path / "tastepack-data"
     (data_dir / "inbox").mkdir(parents=True)

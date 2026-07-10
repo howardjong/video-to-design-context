@@ -69,6 +69,117 @@ def test_inbox_processes_multiple_jobs_and_archives_sources(tmp_path: Path) -> N
     assert not any(paths.processing.iterdir())
 
 
+def test_inbox_processes_asset_bundle_and_archives_all_companions(tmp_path: Path) -> None:
+    intake = tmp_path / "tastepack-data"
+    paths = IntakePaths.from_root(intake)
+    paths.ensure()
+    bundle = paths.inbox / "van-holtz-site"
+    bundle.mkdir()
+    (bundle / "walkthrough.mp4").write_bytes(b"video")
+    (bundle / "narration.mp3").write_bytes(b"audio reference")
+    (bundle / "transcript.md").write_text("# Timestamped transcript\n", encoding="utf-8")
+    processed: list[Path] = []
+
+    def preflight(path: Path, **_kwargs):
+        return {"source_sha256": "bundle-hash", "duration_seconds": 5.0}
+
+    def runner(path: Path, out: Path, _config: TastepackConfig, **kwargs):
+        processed.append(path)
+        kwargs["lifecycle_callback"](
+            "analysis_validated",
+            {
+                "analysis": MOCK_ANALYSIS,
+                "provider_metadata": {"name": "gemini", "model": "gemini-3.5-flash"},
+            },
+        )
+        write_complete_pack(out, "bundle-hash")
+
+    summary = process_inbox(
+        intake,
+        TastepackConfig(produce_pdf=False),
+        stable_seconds=0,
+        preflight=preflight,
+        runner=runner,
+    )
+
+    assert summary.completed == 1
+    assert processed[0].name == "walkthrough.mp4"
+    job = summary.jobs[0]
+    assert job["source_name"] == "van-holtz-site"
+    assert job["input_kind"] == "asset_bundle"
+    assert job["source_video_name"] == "walkthrough.mp4"
+    assert job["source_video_relative_path"] == "walkthrough.mp4"
+    assert job["companion_assets"] == ["narration.mp3", "transcript.md"]
+    assert job["output_path"].startswith("van-holtz-site--")
+    archived_bundle = paths.archive / job["archive_path"]
+    assert archived_bundle.is_dir()
+    assert (archived_bundle / "walkthrough.mp4").is_file()
+    assert (archived_bundle / "narration.mp3").is_file()
+    assert (archived_bundle / "transcript.md").is_file()
+    assert not (archived_bundle / "analysis-snapshot.json").exists()
+
+
+def test_invalid_asset_bundle_moves_entire_bundle_to_failed_and_continues(tmp_path: Path) -> None:
+    intake = tmp_path / "tastepack-data"
+    paths = IntakePaths.from_root(intake)
+    paths.ensure()
+    invalid_bundle = paths.inbox / "missing-video"
+    invalid_bundle.mkdir()
+    (invalid_bundle / "narration.mp3").write_bytes(b"audio reference")
+    (invalid_bundle / "transcript.md").write_text("# Transcript\n", encoding="utf-8")
+    (paths.inbox / "good.mp4").write_bytes(b"video")
+    processed: list[str] = []
+
+    def preflight(path: Path, **_kwargs):
+        return {"source_sha256": "good-hash", "duration_seconds": 5.0}
+
+    def runner(path: Path, out: Path, _config: TastepackConfig, **_kwargs):
+        processed.append(path.name)
+        write_complete_pack(out, "good-hash")
+
+    summary = process_inbox(
+        intake,
+        TastepackConfig(produce_pdf=False),
+        stable_seconds=0,
+        preflight=preflight,
+        runner=runner,
+    )
+
+    assert summary.completed == 1
+    assert summary.failed == 1
+    assert processed == ["good.mp4"]
+    failed_job = next(job for job in summary.jobs if job["status"] == "failed")
+    assert failed_job["failure"]["category"] == "input"
+    assert "exactly one .mp4 or .mov video" in failed_job["failure"]["reason"]
+    failed_bundle = paths.failed / failed_job["failed_path"]
+    assert (failed_bundle / "narration.mp3").is_file()
+    assert (failed_bundle / "transcript.md").is_file()
+
+
+def test_retry_failed_asset_bundle_restores_all_assets_to_inbox(tmp_path: Path) -> None:
+    intake = tmp_path / "tastepack-data"
+    paths = IntakePaths.from_root(intake)
+    paths.ensure()
+    bundle = paths.inbox / "retry-bundle"
+    bundle.mkdir()
+    (bundle / "only-audio.mp3").write_bytes(b"audio reference")
+    (bundle / "transcript.md").write_text("# Transcript\n", encoding="utf-8")
+
+    summary = process_inbox(
+        intake,
+        TastepackConfig(produce_pdf=False),
+        stable_seconds=0,
+    )
+
+    failed_job = summary.jobs[0]
+    retried = retry_failed(intake, failed_job["job_id"])
+
+    assert retried["status"] == "retry_queued"
+    restored_bundle = paths.inbox / "retry-bundle"
+    assert (restored_bundle / "only-audio.mp3").is_file()
+    assert (restored_bundle / "transcript.md").is_file()
+
+
 def test_input_failure_moves_only_that_source_to_failed_and_continues(tmp_path: Path) -> None:
     intake = tmp_path / "tastepack-data"
     paths = IntakePaths.from_root(intake)

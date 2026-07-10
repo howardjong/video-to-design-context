@@ -332,7 +332,7 @@ def queue_status(root: Path) -> QueueStatus:
         status = str(manifest.get("status", "unknown"))
         state_counts[status] = state_counts.get(status, 0) + 1
         jobs.append(manifest)
-    pending_inputs = sum(1 for path in paths.inbox.iterdir() if _is_supported_input(path))
+    pending_inputs = sum(1 for path in paths.inbox.iterdir() if _is_claimable_input(path))
     return QueueStatus(
         pending_inputs=pending_inputs,
         state_counts=state_counts,
@@ -367,12 +367,11 @@ def retry_failed(
             )
         failed_path = manifest.get("failed_path")
         source = paths.failed / failed_path if isinstance(failed_path, str) else None
-        if source is None or not source.is_file():
-            claimed_path = manifest.get("claimed_path")
-            source = paths.processing / claimed_path if isinstance(claimed_path, str) else None
-        if source is None or not source.is_file():
-            raise ValueError(f"Source video for failed job {job_id} is unavailable")
-        destination = _unique_destination(paths.inbox / manifest["source_name"])
+        if source is None or not _is_claimed_input(source):
+            source = _claimed_input_path(paths, manifest)
+        if source is None or not _is_claimed_input(source):
+            raise ValueError(f"Source input for failed job {job_id} is unavailable")
+        destination = _unique_destination(paths.inbox / _input_name(manifest))
         source.replace(destination)
         _transition(
             paths,
@@ -455,19 +454,23 @@ def discover_stable_inputs(
 ) -> list[Path]:
     candidates: list[Path] = []
     for path in sorted(paths.inbox.iterdir(), key=lambda item: item.name.casefold()):
-        if not _is_supported_input(path):
+        if not _is_claimable_input(path):
             continue
-        first = path.stat()
+        try:
+            first = _input_stability_fingerprint(path)
+        except OSError as exc:
+            logger.warning("Could not inspect inbox input %s: %s", path.name, redact_secrets(exc))
+            continue
         if stable_seconds:
             sleep(stable_seconds)
         try:
-            second = path.stat()
-        except FileNotFoundError:
+            second = _input_stability_fingerprint(path)
+        except OSError:
             continue
-        if first.st_size == second.st_size and first.st_mtime_ns == second.st_mtime_ns:
+        if first == second:
             candidates.append(path)
         else:
-            logger.info("Leaving unstable inbox file for a later run: %s", path.name)
+            logger.info("Leaving unstable inbox input for a later run: %s", path.name)
     return candidates
 
 
@@ -475,15 +478,20 @@ def claim_input(paths: IntakePaths, source: Path) -> dict[str, Any]:
     job_id = uuid4().hex
     processing_dir = paths.processing / job_id
     processing_dir.mkdir(parents=True)
-    claimed_path = processing_dir / source.name
-    source.replace(claimed_path)
+    input_kind = "asset_bundle" if source.is_dir() else "video"
+    claimed_input_path = processing_dir / source.name
+    source.replace(claimed_input_path)
     manifest = {
         "schema_version": 1,
         "job_id": job_id,
         "status": "claimed",
         "attempt": 1,
         "source_name": source.name,
-        "claimed_path": str(claimed_path.relative_to(paths.processing)),
+        "input_name": source.name,
+        "input_kind": input_kind,
+        "output_stem": source.name if input_kind == "asset_bundle" else source.stem,
+        "claimed_input_path": str(claimed_input_path.relative_to(paths.processing)),
+        "claimed_path": str(claimed_input_path.relative_to(paths.processing)),
         "created_at": _timestamp(),
         "updated_at": _timestamp(),
         "history": [{"state": "claimed", "at": _timestamp()}],
@@ -515,6 +523,58 @@ def config_fingerprint(config: TastepackConfig) -> str:
     return _hash_json(values)
 
 
+def _resolve_claimed_video(
+    paths: IntakePaths,
+    manifest: dict[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    claimed_input = _claimed_input_path(paths, manifest)
+    if manifest.get("input_kind") != "asset_bundle":
+        return claimed_input, {}
+    if claimed_input.is_symlink() or not claimed_input.is_dir():
+        raise VideoValidationError(
+            f"Asset bundle is not a regular directory: {_input_name(manifest)}"
+        )
+
+    files: list[Path] = []
+    try:
+        entries = sorted(
+            claimed_input.rglob("*"),
+            key=lambda item: item.relative_to(claimed_input).as_posix().casefold(),
+        )
+        for entry in entries:
+            relative = entry.relative_to(claimed_input)
+            if entry.is_symlink():
+                raise VideoValidationError(
+                    "Asset bundle contains a symbolic link "
+                    f"({relative.as_posix()}). Copy the target file into the bundle instead."
+                )
+            if entry.is_file() and not _is_hidden_relative_path(relative):
+                files.append(entry)
+    except OSError as exc:
+        raise VideoValidationError(
+            f"Could not inspect asset bundle {_input_name(manifest)}: {redact_secrets(exc)}"
+        ) from exc
+
+    videos = [path for path in files if path.suffix.lower() in SUPPORTED_EXTENSIONS]
+    if len(videos) != 1:
+        found = ", ".join(
+            path.relative_to(claimed_input).as_posix() for path in videos[:5]
+        ) or "none"
+        raise VideoValidationError(
+            f"Asset bundle {_input_name(manifest)!r} must contain exactly one .mp4 or .mov "
+            f"video; found {len(videos)} ({found}). Keep MP3 and Markdown files as companions."
+        )
+
+    video = videos[0]
+    return video, {
+        "source_video_name": video.name,
+        "source_video_relative_path": video.relative_to(claimed_input).as_posix(),
+        "companion_assets": [
+            path.relative_to(claimed_input).as_posix() for path in files if path != video
+        ],
+    }
+
+
 def _process_claimed_job(
     paths: IntakePaths,
     manifest: dict[str, Any],
@@ -530,7 +590,11 @@ def _process_claimed_job(
     retry_observer: Callable[[float, BaseException], None],
     snapshot: dict[str, Any] | None = None,
 ) -> None:
-    claimed_path = paths.processing / manifest["claimed_path"]
+    claimed_path, bundle_metadata = _resolve_claimed_video(paths, manifest)
+    if bundle_metadata:
+        manifest.update(bundle_metadata)
+        manifest["claimed_path"] = str(claimed_path.relative_to(paths.processing))
+        _write_manifest(paths, manifest)
     video_metadata = preflight(claimed_path, require_tools=not skip_ffmpeg, config=config)
     source_hash = video_metadata.get("source_sha256")
     if not isinstance(source_hash, str) or not source_hash:
@@ -542,7 +606,7 @@ def _process_claimed_job(
         )
     fingerprint = config_fingerprint(config)
     run_key = hashlib.sha256(f"{source_hash}:{fingerprint}".encode()).hexdigest()
-    output_name = f"{_safe_stem(manifest['source_name'])}--{run_key[:12]}"
+    output_name = f"{_safe_stem(_output_stem(manifest))}--{run_key[:12]}"
     if snapshot is not None and manifest.get("run_key") != run_key:
         raise PipelineFailure(
             "Recovery",
@@ -578,7 +642,7 @@ def _process_claimed_job(
             _transition(paths, manifest, "gemini_started")
             return
         if state == "analysis_validated":
-            snapshot_path = claimed_path.parent / "analysis-snapshot.json"
+            snapshot_path = _claimed_input_path(paths, manifest).parent / "analysis-snapshot.json"
             snapshot = {
                 "analysis": payload["analysis"],
                 "provider_metadata": payload["provider_metadata"],
@@ -706,10 +770,10 @@ def _load_analysis_snapshot(
 
 
 def _requeue_pre_gemini_job(paths: IntakePaths, manifest: dict[str, Any]) -> None:
-    claimed_path = paths.processing / manifest["claimed_path"]
-    destination = _unique_destination(paths.inbox / manifest["source_name"])
-    if claimed_path.exists():
-        claimed_path.replace(destination)
+    claimed_input = _claimed_input_path(paths, manifest)
+    destination = _unique_destination(paths.inbox / _input_name(manifest))
+    if claimed_input.exists():
+        claimed_input.replace(destination)
     _transition(paths, manifest, "requeued", requeued_path=destination.name)
     _cleanup_processing_state(paths, manifest)
 
@@ -748,11 +812,11 @@ def _record_failure(
         step = "Inbox processing"
         next_step = "Resolve this system failure before processing more inbox videos."
         reason = redact_secrets(exc)
-    claimed_path = paths.processing / manifest["claimed_path"]
+    claimed_input = _claimed_input_path(paths, manifest)
     failed_path = _failed_destination(paths, manifest)
-    if claimed_path.exists():
+    if claimed_input.exists():
         failed_path.parent.mkdir(parents=True, exist_ok=True)
-        claimed_path.replace(failed_path)
+        claimed_input.replace(failed_path)
     state_files = _move_processing_state_to_failed(paths, manifest)
     _transition(
         paths,
@@ -770,10 +834,10 @@ def _record_failure(
 
 
 def _defer_claimed_job(paths: IntakePaths, manifest: dict[str, Any], reason: str) -> None:
-    claimed_path = paths.processing / manifest["claimed_path"]
-    destination = _unique_destination(paths.inbox / manifest["source_name"])
-    if claimed_path.exists():
-        claimed_path.replace(destination)
+    claimed_input = _claimed_input_path(paths, manifest)
+    destination = _unique_destination(paths.inbox / _input_name(manifest))
+    if claimed_input.exists():
+        claimed_input.replace(destination)
     _transition(
         paths,
         manifest,
@@ -785,23 +849,23 @@ def _defer_claimed_job(paths: IntakePaths, manifest: dict[str, Any], reason: str
 
 
 def _archive_source(paths: IntakePaths, manifest: dict[str, Any], source_hash: str) -> str:
-    claimed_path = paths.processing / manifest["claimed_path"]
-    destination = paths.archive / f"{_safe_stem(manifest['source_name'])}--{source_hash[:12]}"
-    destination = _unique_destination(destination / manifest["source_name"])
+    claimed_input = _claimed_input_path(paths, manifest)
+    destination = paths.archive / f"{_safe_stem(_output_stem(manifest))}--{source_hash[:12]}"
+    destination = _unique_destination(destination / _input_name(manifest))
     destination.parent.mkdir(parents=True, exist_ok=True)
-    claimed_path.replace(destination)
+    claimed_input.replace(destination)
     return str(destination.relative_to(paths.archive))
 
 
 def _failed_destination(paths: IntakePaths, manifest: dict[str, Any]) -> Path:
-    return paths.failed / manifest["job_id"] / manifest["source_name"]
+    return paths.failed / manifest["job_id"] / _input_name(manifest)
 
 
 def _move_processing_state_to_failed(
     paths: IntakePaths,
     manifest: dict[str, Any],
 ) -> list[str]:
-    processing_dir = (paths.processing / manifest["claimed_path"]).parent
+    processing_dir = _claimed_input_path(paths, manifest).parent
     if not processing_dir.is_dir():
         return []
     failed_dir = paths.failed / manifest["job_id"]
@@ -816,7 +880,7 @@ def _move_processing_state_to_failed(
 
 
 def _cleanup_processing_state(paths: IntakePaths, manifest: dict[str, Any]) -> None:
-    processing_dir = (paths.processing / manifest["claimed_path"]).parent
+    processing_dir = _claimed_input_path(paths, manifest).parent
     if not processing_dir.exists():
         return
     try:
@@ -928,6 +992,51 @@ def _is_supported_input(path: Path) -> bool:
         and not path.name.startswith(".")
         and path.suffix.lower() in SUPPORTED_EXTENSIONS
     )
+
+
+def _is_claimable_input(path: Path) -> bool:
+    return _is_supported_input(path) or (
+        path.is_dir() and not path.is_symlink() and not path.name.startswith(".")
+    )
+
+
+def _is_claimed_input(path: Path) -> bool:
+    return not path.is_symlink() and (path.is_file() or path.is_dir())
+
+
+def _input_stability_fingerprint(path: Path) -> tuple[tuple[str, int, int, int], ...]:
+    paths = [path] if path.is_file() else [path, *path.rglob("*")]
+    fingerprint: list[tuple[str, int, int, int]] = []
+    for item in paths:
+        stat = item.lstat()
+        relative = "." if item == path else item.relative_to(path).as_posix()
+        fingerprint.append((relative, stat.st_size, stat.st_mtime_ns, stat.st_mode))
+    return tuple(fingerprint)
+
+
+def _is_hidden_relative_path(path: Path) -> bool:
+    return any(part.startswith(".") for part in path.parts)
+
+
+def _claimed_input_path(paths: IntakePaths, manifest: dict[str, Any]) -> Path:
+    claimed_path = manifest.get("claimed_input_path", manifest.get("claimed_path"))
+    if not isinstance(claimed_path, str):
+        raise ValueError(f"Job {manifest.get('job_id', '<unknown>')} has no claimed input path")
+    return paths.processing / claimed_path
+
+
+def _input_name(manifest: dict[str, Any]) -> str:
+    name = manifest.get("input_name", manifest.get("source_name"))
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"Job {manifest.get('job_id', '<unknown>')} has no input name")
+    return name
+
+
+def _output_stem(manifest: dict[str, Any]) -> str:
+    stem = manifest.get("output_stem", manifest.get("source_name"))
+    if not isinstance(stem, str) or not stem:
+        raise ValueError(f"Job {manifest.get('job_id', '<unknown>')} has no output stem")
+    return stem
 
 
 def _safe_stem(source_name: str) -> str:
